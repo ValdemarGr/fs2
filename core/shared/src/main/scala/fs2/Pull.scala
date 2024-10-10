@@ -34,6 +34,7 @@ import Resource.ExitCase
 import Pull._
 import cats._
 import cats.arrow.FunctionK
+import cats.data.StateT
 
 /** A purely functional data structure that describes a process. This process
   * may evaluate actions in an effect type F, emit any number of output values
@@ -121,1242 +122,1242 @@ import cats.arrow.FunctionK
   *           An output type of `Nothing` indicates that this pull cannot terminate
   *           successfully: it may fail, be cancelled, or never terminate.
   */
-sealed abstract class Pull[+F[_], +O, +R] {
-
-  /** Applies the result of this pull to `f` and returns the result.
-    *
-    * This method returns a new composed pull, which will do as follows:
-    *
-    * - If `this` pull succeeds with a result `r` of type R, the `f` function
-    *   is applied to `r`, to build a new pull `f(r)`, and the result pull
-    *   starts running that new pull. The composed pull will terminate (or not)
-    *   just as the new pull `f(r)` does.
-    * - If `this` pull fails or is interrupted, then the composed pull
-    *   terminates with that same failure or interruption.
-    * - If evaluating `f(r)` to build the pull throws an exception, the result
-    *   is a pull that fails with that exception.
-    *
-    * The composed pull emits all outputs emitted by `this` pull,
-    * and if successful will start emitting the outputs from the generated pull.
-    *
-    * This operation does not modify resource scope boundaries. The generated
-    * `post` pull starts running on the same scope in which `this` pull ended,
-    * and the composed pull will end on the same scope in which `post` pull does.
-    */
-  def flatMap[F2[x] >: F[x], O2 >: O, R2](f: R => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
-    new Bind[F2, O2, R, R2](this) {
-      def cont(e: Terminal[R]): Pull[F2, O2, R2] =
-        e match {
-          case Succeeded(r) =>
-            try f(r)
-            catch { case NonFatal(e) => Fail(e) }
-          case res @ Interrupted(_, _) => res
-          case res @ Fail(_)           => res
-        }
-    }
-
-  /** Lazily appends the given `post` pull, to be run after `this` pull.
-    *
-    * - If `this` pull succeeds, then its result is discarded, the `post`
-    *   pull is built, and starts running. The result of `post` is
-    *   the result of the composed pull.
-    *
-    * - If `this` pull raises an error or is interrupted, the `post` argument is
-    *   not evaluated and the composed pull ends just as `this` pull did.
-    *
-    * In both cases, the effectful actions and outputs of the appended pull
-    * consists of those outputs and actions from the first pull, followed by
-    * those from the `post` pull, in the same order as they would come out of each pull.
-    *
-    * Since the `post` argument is lazy, this method can be used to build lazy
-    * pulls, which are not built in memory until after the prefix has run.
-    * This allows defining pulls recursively.
-    *
-    * This operation does not add or remove any resource scope boundaries.
-    * The `post` pull runs on the same scope in which `this` pull ended.
-    * The composed pull ends on whatever scope the `post` pull does.
-    *
-    * This is equivalent to `.flatMap(_ => post)`
-    */
-  def >>[F2[x] >: F[x], O2 >: O, S](post: => Pull[F2, O2, S]): Pull[F2, O2, S] =
-    new Bind[F2, O2, R, S](this) {
-      def cont(r: Terminal[R]): Pull[F2, O2, S] =
-        r match {
-          case _: Succeeded[?] => post
-          case r: Interrupted  => r
-          case r: Fail         => r
-        }
-    }
-
-  /** Alias for `flatMap(r => Pull.eval(f(r)))`. */
-  def evalMap[F2[x] >: F[x], R2](f: R => F2[R2]): Pull[F2, O, R2] =
-    flatMap(r => Pull.eval(f(r)))
-
-  /** Allows to recover from any error raised by the evaluation of this pull.
-    * This method returns a composed pull with the following semantics:
-    * - If an error occurs, the supplied function is used to build a new handler
-    *   pull, and it starts running it. However, the pull cannot be resumed from
-    *   the point at which the error arose.
-    * - If no error is raised, the resulting pull just does what `this` pull does.
-    */
-  def handleErrorWith[F2[x] >: F[x], O2 >: O, R2 >: R](
-      handler: Throwable => Pull[F2, O2, R2]
-  ): Pull[F2, O2, R2] =
-    new Bind[F2, O2, R2, R2](this) {
-      def cont(term: Terminal[R2]): Pull[F2, O2, R2] =
-        term match {
-          case Fail(e) =>
-            try handler(e)
-            catch { case NonFatal(e) => Fail(e) }
-          case other => other
-        }
-    }
-
-  /** Run `post` after `this`, regardless of errors during `this`:
-    *
-    * - If `this` pull terminates successfully, then its result is discarded
-    *   and the `post` pull is run. However the `post` pull ends, be it in
-    *   success, error, interruption, is how the combined pull ends.
-    *
-    * - If `this` pull fails, the `post` pull is run next. If the `post` pull
-    *   ends, fails, or is interrupted, that is how the combined pull ends.
-    *   However, if the `post` pull succeeds, then the combined `onComplete` pull
-    *   fails again with the error that was raised from `this` pull.
-    *
-    * - If `this` pull is interrupted, then the `post` pull is never run
-    *   and the combined pull ends with that same interruption.
-    */
-  def onComplete[F2[x] >: F[x], O2 >: O, R2](post: => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
-    handleErrorWith(e => post >> Fail(e)) >> post
-
-  /** Short-hand for `(this: Pull[F2, P, S])`. Used to assist with type inference. */
-  def covaryAll[F2[x] >: F[x], O2 >: O, R2 >: R]: Pull[F2, O2, R2] = this
-
-  /** Short-hand for `(this: Pull[F2, O, R])`. Used to assist with type inference. */
-  def covary[F2[x] >: F[x]]: Pull[F2, O, R] = this
-
-  /** Short-hand for `(this: Pull[F, O2, R])`. Used to assist with type inference. */
-  def covaryOutput[O2 >: O]: Pull[F, O2, R] = this
-
-  /** Short-hand for `(this: Pull[F, O, R2])`. Used to assist with type inference. */
-  def covaryResult[R2 >: R]: Pull[F, O, R2] = this
-
-  /** Returns a pull with the result wrapped in `Right`,
-    * or an error wrapped in `Left` if the pull has raised an error.
-    * If `this` pull is interrupted, the attempted pull ends the same way.
-    */
-  def attempt: Pull[F, O, Either[Throwable, R]] =
-    map(r => Right(r)).handleErrorWith(t => Succeeded(Left(t)))
-
-  /** Maps the result of this pull with the `f` mapping function.
-    *
-    * If `this` pull ends in success with a result `r`, then the function `f`
-    * is applied to its result `r`, and the image `f(r)` is the result of the
-    * mapped pull. However, if the evaluation of `f(r)` throws an error, the
-    * mapped pull fails with that error.
-    *
-    * Note: for some simple cases of Pull, the `map` function may be eagerly
-    * applied, or discarded, _before_ the pull starts being run.
-    *
-    * If `this` pull terminates abnormally, so does the mapped pull.
-    */
-  def map[S](f: R => S): Pull[F, O, S] =
-    new Bind[F, O, R, S](this) {
-      def cont(r: Terminal[R]) = r.map(f)
-    }
-
-  /** Discards the result of this pull.
-    *
-    * If `this` pull ends in success, its result is discarded and the _voided_
-    * pull returns the unit `()` value. Otherwise, the voided pull just does
-    * the same as `this` pull does.
-    *
-    * Alias for `this.map(_ => ())`.
-    */
-  def void: Pull[F, O, Unit] = as(())
-
-  /** Replaces the result of this pull with the given constant value.
-    * If `this` pull succeeds, then its result is discarded and the resulting
-    * pull succeeds with the `s` value as its result.
-    * Otherwise, if `this` pull fails or is interrupted, then the result pull
-    * ends the same way.
-    *
-    * Alias for `_.map(_ => o2)`.
-    *
-    * @tparam S The type of the constant,
-    * @param  s The new result value of the pull
-    */
-  def as[S](s: S): Pull[F, O, S] = map(_ => s)
-
-  /** Leases all resources that are currently open, canceling the lease at the
-    * termination of this pull.
-    */
-  def lease: Pull[F, O, R] =
-    Pull.bracketCase[F, O, Lease[F], R](
-      Pull.getScope[F].evalMap(_.lease),
-      _ => this,
-      (l, _) => Pull.eval(l.cancel).rethrow
-    )
-}
-
-object Pull extends PullLowPriority {
-
-  implicit final class StreamPullOps[F[_], O](private val self: Pull[F, O, Unit]) extends AnyVal {
-
-    /** Interprets this pull to produce a stream. This method introduces a resource
-      * scope, to ensure any resources acquired by this pull are released in due
-      * course, even if the resulting stream does not terminate successfully.
-      *
-      * May only be called on pulls which return a `Unit` result type. Use
-      * `p.void.stream` to explicitly ignore the result type of the pull.
-      */
-    def stream: Stream[F, O] = new Stream(Pull.scope(self))
-
-    /** Interpret this `Pull` to produce a `Stream` without introducing a scope.
-      *
-      * Only use this if you know a scope is not needed. Scope introduction is
-      *
-      * generally harmless and the risk of not introducing a scope is a memory leak
-      * in streams that otherwise would execute in constant memory.
-      *
-      * May only be called on pulls whose result type is `Unit`.
-      * Use `p.void.stream` to explicitly ignore the result of a pull.
-      */
-    def streamNoScope: Stream[F, O] = new Stream(self)
-
-    private[fs2] def flatMapOutput[F2[x] >: F[x], O2](
-        f: O => Pull[F2, O2, Unit]
-    ): Pull[F2, O2, Unit] =
-      self match {
-        case a: AlgEffect[F, Unit] => a
-        case r: Terminal[?]        => r
-        case _                     => FlatMapOutput(self, f)
-      }
-
-    private[fs2] def unconsFlatMap[F2[x] >: F[x], O2](
-        f: Chunk[O] => Pull[F2, O2, Unit]
-    ): Pull[F2, O2, Unit] =
-      uncons.flatMap {
-        case None           => Pull.done
-        case Some((hd, tl)) => f(hd) >> tl.unconsFlatMap(f)
-      }
-
-    /* Pull transformation that takes the given stream (pull), unrolls it until it either:
-     * - Reaches the end of the stream, and returns None; or
-     * - Reaches an Output action, and emits Some pair with
-     *   the non-empty chunk of values and the rest of the stream.
-     */
-    private[fs2] def uncons: Pull[F, Nothing, Option[(Chunk[O], Pull[F, O, Unit])]] =
-      self match {
-        case Succeeded(_)    => Succeeded(None)
-        case Output(vals)    => Succeeded(Some(vals -> unit))
-        case ff: Fail        => ff
-        case it: Interrupted => it
-        case _               => Uncons(self)
-      }
-
-  }
-
-  private[this] val unit: Terminal[Unit] = Succeeded(())
-
-  private[fs2] val outUnit: Pull[Pure, Unit, Unit] = Output(Chunk.unit)
-
-  /** A pull that performs no effects, emits no outputs, and
-    * always terminates successfully with a unit result.
-    */
-  val done: Pull[Nothing, Nothing, Unit] = unit
-
-  /** Creates an pull that performs no effects, emits no outputs,
-    * and terminates successfully with the supplied value as its result.
-    */
-  def pure[F[_], R](r: R): Pull[F, Nothing, R] = Succeeded(r)
-
-  /** Lifts a throwable error into an atomic pull that emits no outputs and
-    * fails with the given error, without any result.
-    *
-    * The `F` type must be explicitly provided (e.g., via `raiseError[IO]`
-    * or `raiseError[Fallible]`).
-    */
-  def raiseError[F[_]: RaiseThrowable](err: Throwable): Pull[F, Nothing, Nothing] = Fail(err)
-
-  /** Creates a pull that evaluates the supplied effect `fr`, emits no
-    * outputs, and terminates with the result of the effect.
-    * If the `fr` effect fails with an error, the new pull fails with that error.
-    */
-  def eval[F[_], R](fr: F[R]): Pull[F, Nothing, R] = Eval[F, R](fr)
-
-  /** Creates a pull that waits for the duration `d` */
-  def sleep[F[_]](d: FiniteDuration)(implicit t: Temporal[F]): Pull[F, Nothing, Unit] =
-    Pull.eval(t.sleep(d))
-
-  /** Lifts the given output value `O` into a pull that performs no
-    * effects, emits that single output in a singleton chunk, and always
-    * terminates successfully with a unit result.
-    *
-    * _Note_: using singleton chunks is not efficient. If possible,
-    * use the chunk-based `output` method instead.
-    */
-  def output1[F[_], O](o: O): Pull[F, O, Unit] = Output(Chunk.singleton(o))
-
-  /** Lifts the given optional value `O` into a pull that performs no
-    * effects, emits the content of that option, and always
-    * terminates successfully with a unit result.
-    */
-  def outputOption1[F[_], O](opt: Option[O]): Pull[F, O, Unit] =
-    opt.map(output1).getOrElse(done)
-
-  /** Creates a pull that emits the elements of the given chunk.
-    * The new pull performs no effects and terminates successfully with a unit result.
-    */
-  def output[F[_], O](os: Chunk[O]): Pull[F, O, Unit] =
-    if (os.isEmpty) Pull.done else Output[O](os)
-
-  private[fs2] def acquire[F[_], R](
-      resource: F[R],
-      release: (R, ExitCase) => F[Unit]
-  ): Pull[F, Nothing, R] =
-    Acquire(resource, release, cancelable = false)
-
-  private[fs2] def acquireCancelable[F[_], R](
-      resource: Poll[F] => F[R],
-      release: (R, ExitCase) => F[Unit]
-  )(implicit F: MonadCancel[F, ?]): Pull[F, Nothing, R] =
-    Acquire(F.uncancelable(resource), release, cancelable = true)
-
-  /** Like [[eval]] but if the effectful value fails, the exception is returned
-    * in a `Left` instead of failing the pull.
-    */
-  def attemptEval[F[_], R](fr: F[R]): Pull[F, Nothing, Either[Throwable, R]] =
-    Eval[F, R](fr)
-      .map(r => Right(r): Either[Throwable, R])
-      .handleErrorWith(t => Succeeded[Either[Throwable, R]](Left(t)))
-
-  def bracketCase[F[_], O, A, B](
-      acquire: Pull[F, O, A],
-      use: A => Pull[F, O, B],
-      release: (A, ExitCase) => Pull[F, O, Unit]
-  ): Pull[F, O, B] =
-    acquire.flatMap { a =>
-      val used =
-        try use(a)
-        catch { case NonFatal(t) => Fail(t) }
-      transformWith(used) { result =>
-        val exitCase: ExitCase = result match {
-          case Succeeded(_)      => ExitCase.Succeeded
-          case Fail(err)         => ExitCase.Errored(err)
-          case Interrupted(_, _) => ExitCase.Canceled
-        }
-
-        transformWith(release(a, exitCase)) {
-          case Fail(t2) =>
-            result match {
-              case Fail(tres) => Fail(CompositeFailure(tres, t2))
-              case result     => result
-            }
-          case _ => result
-        }
-      }
-    }
-
-  /** Extends the scope of the currently open resources to the specified stream,
-    * preventing them from being finalized until after `s` completes execution,
-    * even if the returned pull is converted to a stream, compiled, and
-    * evaluated before `s` is compiled and evaluated.
-    */
-  def extendScopeTo[F[_], O](
-      s: Stream[F, O]
-  )(implicit F: MonadError[F, Throwable]): Pull[F, Nothing, Stream[F, O]] =
-    for {
-      scope <- Pull.getScope[F]
-      lease <- Pull.eval(scope.lease)
-    } yield s.onFinalize(lease.cancel.redeemWith(F.raiseError(_), _ => F.unit))
-
-  /** Repeatedly uses the output of the pull as input for the next step of the
-    * pull. Halts when a step terminates with `None` or `Pull.raiseError`.
-    */
-  def loop[F[_], O, R](f: R => Pull[F, O, Option[R]]): R => Pull[F, O, Unit] =
-    (r: R) =>
-      f(r).flatMap {
-        case None    => Pull.done
-        case Some(s) => loop(f)(s)
-      }
-
-  /** Intantiates with a state. Repeatedly uses the left value of the result of
-    * the pull as input for the next step. The Pull terminates when a step terminates with
-    * `Right` or `Pull.raiseError`.
-    */
-  def loopEither[F[_], O, S, R](f: S => Pull[F, O, Either[S, R]]): S => Pull[F, O, R] =
-    (s: S) =>
-      f(s).flatMap {
-        case Left(ns) => loopEither(f)(ns)
-        case Right(r) => Pull.pure(r)
-      }
-
-  private[fs2] def fail[F[_]](err: Throwable): Pull[F, Nothing, Nothing] = Fail(err)
-
-  final class PartiallyAppliedFromEither[F[_]] {
-    def apply[A](either: Either[Throwable, A])(implicit ev: RaiseThrowable[F]): Pull[F, A, Unit] =
-      either.fold(raiseError[F], output1)
-  }
-
-  /** Lifts an Either[Throwable, A] to an effectful Pull[F, A, Unit].
-    *
-    * @example {{{
-    * scala> import cats.effect.SyncIO, scala.util.Try
-    * scala> Pull.fromEither[SyncIO](Right(42)).stream.compile.toList.unsafeRunSync()
-    * res0: List[Int] = List(42)
-    * scala> Try(Pull.fromEither[SyncIO](Left(new RuntimeException)).stream.compile.toList.unsafeRunSync())
-    * res1: Try[List[Nothing]] = Failure(java.lang.RuntimeException)
-    * }}}
-    */
-  def fromEither[F[x]] = new PartiallyAppliedFromEither[F]
-
-  /** Gets the current scope, allowing manual leasing or interruption.
-    * This is a low-level method and generally should not be used by user code.
-    */
-  private[fs2] def getScope[F[_]]: Pull[F, Nothing, Scope[F]] = GetScope[F]()
-
-  /** Returns a pull that evaluates the supplied by-name each time the pull is
-    * used, allowing use of a mutable value in pull computations.
-    */
-  def suspend[F[_], O, R](p: => Pull[F, O, R]): Pull[F, O, R] =
-    new Bind[F, O, Unit, R](unit) {
-      def cont(r: Terminal[Unit]): Pull[F, O, R] = p
-    }
-
-  /** An abstraction for writing `Pull` computations that can timeout
-    * while reading from a `Stream`.
-    *
-    * A `Pull.Timed` is not created or intepreted directly, but by
-    * calling [[Stream.ToPull.timed]].
-    *
-    * {{{
-    * yourStream.pull.timed(tp => ...).stream
-    * }}}
-    *
-    * The argument to `timed` is a `Pull.Timed[F, O] => Pull[F, O2, R]`
-    * function, which describes the pulling logic and is often recursive,
-    * with shape:
-    *
-    * {{{
-    * def go(timedPull: Pull.Timed[F, A]): Pull[F, B, Unit] =
-    *   timedPull.uncons.flatMap {
-    *     case Some((Right(chunk), next)) => doSomething >> go(next)
-    *     case Some((Left(_), next)) => doSomethingElse >> go(next)
-    *     case None => Pull.done
-    *   }
-    * }}}
-    *
-    * Where `doSomething` and `doSomethingElse` are `Pull` computations
-    * such as `Pull.output`, in addition to `Pull.Timed.timeout`.
-    *
-    * See below for detailed descriptions of `timeout` and `uncons`, and
-    * look at the [[Stream.ToPull.timed]] scaladoc for an example of usage.
-    */
-  trait Timed[F[_], O] {
-    type Timeout
-
-    /** Waits for either a chunk of elements to be available in the
-      * source stream, or a timeout to trigger. Whichever happens
-      * first is provided as the resource of the returned pull,
-      * alongside a new timed pull that can be used for awaiting
-      * again. A `None` is returned as the resource of the pull upon
-      * reaching the end of the stream.
-      *
-      * Receiving a timeout is not a fatal event: the evaluation of the
-      * current chunk is not interrupted, and the next timed pull is
-      * still returned for further iteration. The lifetime of timeouts
-      * is handled by explicit calls to the `timeout` method: `uncons`
-      * does not start, restart or cancel any timeouts.
-      *
-      * Note that the type of timeouts is existential in `Pull.Timed`
-      * (hidden, basically) so you cannot do anything on it except for
-      * pattern matching, which is best done as a `Left(_)` case.
-      */
-    def uncons: Pull[F, Nothing, Option[(Either[Timeout, Chunk[O]], Pull.Timed[F, O])]]
-
-    /** Asynchronously starts a timeout that will be received by
-      * `uncons` after `t`, and immediately returns.
-      *
-      * Timeouts are resettable: if `timeout` executes whilst a
-      * previous timeout is pending, it will cancel it before starting
-      * the new one, so that there is at most one timeout in flight at
-      * any given time. The implementation guards against stale
-      * timeouts: after resetting a timeout, a subsequent `uncons` is
-      * guaranteed to never receive an old one.
-      *
-      * Timeouts can be reset to any `t`, longer or shorter than the
-      * previous timeout, but a duration of 0 is treated specially, in
-      * that it will cancel a pending timeout but not start a new one.
-      *
-      * Note:
-      * If for some reason you insert a pause in between `uncons` and
-      * `timeout`, such as:
-      * {{{
-      * timedPull.timeout(n.millis) >>
-      *   Pull.eval(IO.sleep(m.millis)) >>
-      *   timedPull.uncons.flatMap { ...
-      * }}}
-      *
-      * you should be aware that an invocation of `timeout` that
-      * happens before the very first `uncons` will start the timeout
-      * simultaneously with the very first `uncons`. Subsequent
-      * invocations of `timeout` start the timeout immediately
-      * instead.
-      *
-      * This is an implementation detail which should not affect most
-      * cases, given that usually there is no need to sleep in between
-      * `timeout` and the very first call to `uncons`.
-      */
-    def timeout(t: FiniteDuration): Pull[F, Nothing, Unit]
-  }
-
-  /** `Sync` instance for `Pull`. */
-  implicit def syncInstance[F[_]: Sync, O]: Sync[Pull[F, O, *]] =
-    new PullSyncInstance[F, O]
-
-  /** `FunctionK` instance for `F ~> Pull[F, Nothing, *]`
-    *
-    * @example {{{
-    * scala> import cats.Id
-    * scala> Pull.functionKInstance[Id](42).flatMap(Pull.output1).stream.compile.toList
-    * res0: cats.Id[List[Int]] = List(42)
-    * }}}
-    */
-  implicit def functionKInstance[F[_]]: F ~> Pull[F, Nothing, *] =
-    new (F ~> Pull[F, Nothing, *]) {
-      def apply[X](fx: F[X]) = Pull.eval(fx)
-    }
-
-  /* Implementation notes:
-   *
-   * A Pull can be one of the following:
-   *  - A Terminal - the end result of pulling. This may have ended in:
-   *    - Succeeded with a result of type R.
-   *    - Failed with an exception
-   *    - Interrupted from another thread with a known `scopeId`
-   *
-   *  - A Bind, that binds a first computation(another Pull) with a method to _continue_
-   *    the computation from the result of the first one `step`.
-   *
-   *  - A single Action, which can be one of following:
-   *
-   *    - Eval (or lift) an effectful operation of type `F[R]`
-   *    - Output some values of type O.
-   *    - Acquire a new resource and add its cleanup to the current scope.
-   *    - Open, Close, or Access to the resource scope.
-   *    - side-Step or fork to a different computation
-   */
-
-  /* A Terminal indicates how a pull evaluation ended.
-   * A pull may have succeeded with a result, failed with an exception,
-   * or interrupted from another concurrent pull.
-   */
-  private sealed abstract class Terminal[+R]
-      extends Pull[Nothing, Nothing, R]
-      with ViewL[Nothing, Nothing]
-
-  private final case class Succeeded[+R](r: R) extends Terminal[R] {
-    override def map[R2](f: R => R2): Terminal[R2] =
-      try Succeeded(f(r))
-      catch { case NonFatal(err) => Fail(err) }
-  }
-
-  private final case class Fail(error: Throwable) extends Terminal[Nothing] {
-    override def map[R](f: Nothing => R): Terminal[R] = this
-  }
-
-  /** Signals that pull evaluation was interrupted.
-    *
-    * @param context Any user specific context that needs to be captured
-    *                during interruption for eventual resume of the operation.
-    *
-    * @param deferredError Any errors, accumulated during resume of the interruption.
-    *                      Instead throwing errors immediately during interruption,
-    *                      signalling of the errors may be deferred until the Interruption resumes.
-    */
-  private final case class Interrupted(context: Unique.Token, deferredError: Option[Throwable])
-      extends Terminal[Nothing] {
-    override def map[R](f: Nothing => R): Terminal[R] = this
-  }
-
-  private sealed trait ContP[-Y, +F[_], +O, +X] extends (Terminal[Y] => Pull[F, O, X]) {
-    def apply(r: Terminal[Y]): Pull[F, O, X] = cont(r)
-    protected def cont(r: Terminal[Y]): Pull[F, O, X]
-  }
-
-  private object IdContP extends ContP[Unit, Nothing, Nothing, Unit] {
-    def cont(r: Terminal[Unit]): Pull[Nothing, Nothing, Unit] = r
-  }
-
-  private abstract class Bind[+F[_], +O, X, +R](val step: Pull[F, O, X])
-      extends Pull[F, O, R]
-      with ContP[X, F, O, R] {
-    def cont(r: Terminal[X]): Pull[F, O, R]
-    def delegate: Bind[F, O, X, R] = this
-  }
-
-  /* Unrolled view of a `Pull` structure. */
-  private sealed trait ViewL[+F[_], +O]
-
-  // This class is not created by the combinators in the public Pull API, only during compilation
-  private class DelegateBind[F[_], O, Y](
-      step: Pull[F, O, Y],
-      override val delegate: Bind[F, O, Y, Unit]
-  ) extends Bind[F, O, Y, Unit](step) {
-    def cont(yr: Terminal[Y]): Pull[F, O, Unit] = delegate.cont(yr)
-  }
-
-  private def bindView[F[_], O, Y](
-      fmoc: Pull[F, O, Unit],
-      view: Cont[Unit, F, O]
-  ): Pull[F, O, Unit] =
-    view match {
-      case IdContP => fmoc
-      case bv: Bind[F, O, Unit, Unit] @unchecked =>
-        fmoc match {
-          case r: Terminal[Unit] =>
-            try bv(r)
-            catch { case NonFatal(e) => Fail(e) }
-          case _ => new DelegateBind[F, O, Unit](fmoc, bv.delegate)
-        }
-      case _ =>
-        new Bind[F, O, Unit, Unit](fmoc) {
-          def cont(r: Terminal[Unit]) = view(r)
-        }
-    }
-
-  // This class is not created by combinators in public Pull API, only during compilation
-  private class BindBind[F[_], O, X, Y](
-      step: Pull[F, O, X],
-      val bb: Bind[F, O, X, Y],
-      val del: Bind[F, O, Y, Unit]
-  ) extends Bind[F, O, X, Unit](step) {
-    def cont(tx: Terminal[X]): Pull[F, O, Unit] =
-      try bindBindAux(bb.cont(tx), del)
-      catch { case NonFatal(e) => Fail(e) }
-  }
-
-  @tailrec @nowarn("cat=unchecked")
-  private def bindBindAux[F[_], O, X](
-      py: Pull[F, O, X],
-      del: Bind[F, O, X, Unit]
-  ): Pull[F, O, Unit] =
-    py match {
-      case ty: Terminal[X] =>
-        del match {
-          case cici: BindBind[F, O, ?, X] =>
-            bindBindAux(cici.bb.cont(ty), cici.del)
-          case _ => del.cont(ty)
-        }
-      case x => new DelegateBind(x, del)
-    }
-
-  /* An action is an instruction that can perform effects in `F`
-   * to generate by-product outputs of type `O`.
-   *
-   * Each operation also generates an output of type `R` that is used
-   * as control information for the rest of the interpretation or compilation.
-   */
-  private sealed abstract class Action[+F[_], +O, +R] extends Pull[F, O, R] with ViewL[F, O]
-
-  /* An action that emits a non-empty chunk of outputs. */
-  private final case class Output[+O](values: Chunk[O]) extends Action[Nothing, O, Unit]
-
-  /* A translation point, that wraps an inner stream written in another effect. */
-  private final case class Translate[G[_], F[_], +O](
-      stream: Pull[G, O, Unit],
-      fk: G ~> F
-  ) extends Action[F, O, Unit]
-
-  private final case class FlatMapOutput[+F[_], O, +P](
-      stream: Pull[F, O, Unit],
-      fun: O => Pull[F, P, Unit]
-  ) extends Action[F, P, Unit]
-
-  /* Steps through the given inner stream, until the first `Output` is reached.
-   * It returns the possible `uncons`.
-   * Yields to head in form of chunk, then id of the scope that was active
-   * after step evaluated and tail of the `stream`.
-   *
-   * @param stream             Stream to step
-   */
-  private final case class Uncons[+F[_], +O](stream: Pull[F, O, Unit])
-      extends Action[Nothing, Nothing, Option[(Chunk[O], Pull[F, O, Unit])]]
-
-  /** Steps through the stream, providing a `stepLeg`.
-    * Yields to head in form of chunk, then id of the scope that was active after step evaluated and tail of the `stream`.
-    *
-    * @param stream Stream to step
-    * @param scope  Scope has to be changed before this step is evaluated, id of the scope must be supplied
-    */
-  private final case class StepLeg[+F[_], +O](stream: Pull[F, O, Unit], scope: Unique.Token)
-      extends Action[Nothing, Nothing, Option[Stream.StepLeg[F, O]]]
-
-  /* The `AlgEffect` trait is for operations on the `F` effect that create no `O` output. */
-  private sealed abstract class AlgEffect[+F[_], R] extends Action[F, Nothing, R]
-
-  private final case class Eval[+F[_], R](value: F[R]) extends AlgEffect[F, R]
-
-  private final case class Acquire[+F[_], R](
-      resource: F[R],
-      release: (R, ExitCase) => F[Unit],
-      cancelable: Boolean
-  ) extends AlgEffect[F, R]
-
-  private final case class InScope[+F[_], +O](
-      stream: Pull[F, O, Unit],
-      useInterruption: Boolean
-  ) extends Action[F, O, Unit]
-
-  private final case class InterruptWhen[+F[_]](haltOnSignal: F[Either[Throwable, Unit]])
-      extends AlgEffect[F, Unit]
-
-  // `InterruptedScope` contains id of the scope currently being interrupted
-  // together with any errors accumulated during interruption process
-  private abstract class CloseScope extends AlgEffect[Nothing, Unit] {
-    def scopeId: Unique.Token
-    def interruption: Option[Interrupted]
-    def exitCase: ExitCase
-  }
-
-  private final case class SucceedScope(scopeId: Unique.Token) extends CloseScope {
-    def exitCase: ExitCase = ExitCase.Succeeded
-    def interruption: Option[Interrupted] = None
-  }
-
-  private final case class CanceledScope(scopeId: Unique.Token, inter: Interrupted)
-      extends CloseScope {
-    def exitCase: ExitCase = ExitCase.Canceled
-    def interruption: Option[Interrupted] = Some(inter)
-  }
-
-  private final case class FailedScope(scopeId: Unique.Token, err: Throwable) extends CloseScope {
-    def exitCase: ExitCase = ExitCase.Errored(err)
-    def interruption: Option[Interrupted] = None
-  }
-
-  private final case class GetScope[F[_]]() extends AlgEffect[Nothing, Scope[F]]
-
-  /** Ignores current stepLeg head, goes on with remaining data */
-  private[fs2] def stepLeg[F[_], O](
-      leg: Stream.StepLeg[F, O]
-  ): Pull[F, Nothing, Option[Stream.StepLeg[F, O]]] =
-    StepLeg[F, O](leg.next, leg.scopeId)
-
-  /** Wraps supplied pull in new scope, that will be opened before this pull is evaluated
-    * and closed once this pull either finishes its evaluation or when it fails.
-    */
-  private[fs2] def scope[F[_], O](s: Pull[F, O, Unit]): Pull[F, O, Unit] = InScope(s, false)
-
-  /** Like `scope` but allows this scope to be interrupted.
-    * Note that this may fail with `Interrupted` when interruption occurred
-    */
-  private[fs2] def interruptScope[F[_], O](s: Pull[F, O, Unit]): Pull[F, O, Unit] = InScope(s, true)
-
-  private[fs2] def interruptWhen[F[_], O](
-      haltOnSignal: F[Either[Throwable, Unit]]
-  ): Pull[F, O, Unit] = InterruptWhen(haltOnSignal)
-
-  private type Cont[-Y, +G[_], +O] = Terminal[Y] => Pull[G, O, Unit]
-
-  private[this] type Nought[A] = Any
-
-  /* Left-folds the output of a stream in to a single value of type `B`.
-   *
-   * === Interruption ===
-   *
-   * Interruption of the stream is implemented cooperatively between `Pull` and `Scope`.
-   * Unlike interruption of an `F[_]: MonadCancelThrow` type (e.g. `IO`), stream interruption
-   * needs to find the recovery point where stream evaluation continues.
-   */
-  private[fs2] def compile[F[_], O, B](
-      stream: Pull[F, O, Unit],
-      initScope: Scope[F],
-      extendLastTopLevelScope: Boolean,
-      init: B
-  )(foldChunk: (B, Chunk[O]) => B)(implicit
-      F: MonadError[F, Throwable]
-  ): F[B] = {
-    var contP: ContP[Nothing, Nought, Any, Unit] = null
-
-    def getCont(): Cont[Any, Nothing, Nothing] = contP.asInstanceOf[Cont[Any, Nothing, Nothing]]
-
-    @tailrec
-    def viewL[G[_], X](free: Pull[G, X, Unit]): ViewL[G, X] =
-      free match {
-        case e: Action[G, X, Unit] =>
-          contP = IdContP
-          e
-        case b: Bind[G, X, y, Unit] =>
-          type Y = y
-          b.step match {
-            case c: Bind[G, X, z, Y] =>
-              viewL(new BindBind[G, X, z, Y](c.step, c.delegate, b.delegate))
-            case e: Action[G, X, ?] =>
-              contP = b.delegate
-              e
-            case r: Terminal[Y] => viewL(b.cont(r))
-          }
-        case r: Terminal[Unit] => r
-      }
-
-    /* Inject interruption to the tail used in `flatMap`. Assures that close of the scope
-     * is invoked if at the flatMap tail, otherwise switches evaluation to `interrupted` path. */
-    def interruptBoundary[G[_], X](
-        stream: Pull[G, X, Unit],
-        interruption: Interrupted
-    ): Pull[G, X, Unit] =
-      viewL(stream) match {
-        case cs: CloseScope =>
-          // Inner scope is getting closed b/c a parent was interrupted
-          val cl: Pull[G, X, Unit] = CanceledScope(cs.scopeId, interruption)
-          transformWith(cl)(getCont())
-        case _: Action[G, X, y] =>
-          // all other actions, roll the interruption forwards
-          getCont()(interruption)
-        case interrupted: Interrupted => interrupted // impossible
-        case _: Succeeded[?]          => interruption
-        case failed: Fail =>
-          val errs = interruption.deferredError.toList :+ failed.error
-          Fail(CompositeFailure.fromList(errs).getOrElse(failed.error))
-      }
-
-    trait Run[-G[_], -X, +End] {
-      def done(scope: Scope[F]): End
-      def out(head: Chunk[X], scope: Scope[F], tail: Pull[G, X, Unit]): End
-      def interrupted(inter: Interrupted): End
-      def fail(e: Throwable): End
-    }
-    type CallRun[+G[_], +X, End] = Run[G, X, End] => End
-
-    object TheBuildR extends Run[Nothing, Nothing, F[CallRun[Nothing, Nothing, F[Nothing]]]] {
-      def fail(e: Throwable) = F.raiseError(e)
-      def done(scope: Scope[F]) = F.pure(_.done(scope))
-      def out(head: Chunk[Nothing], scope: Scope[F], tail: Pull[Nothing, Nothing, Unit]) =
-        F.pure(_.out(head, scope, tail))
-      def interrupted(i: Interrupted) = F.pure(_.interrupted(i))
-    }
-
-    def buildR[G[_], X, End]: Run[G, X, F[CallRun[G, X, F[End]]]] =
-      TheBuildR.asInstanceOf[Run[G, X, F[CallRun[G, X, F[End]]]]]
-
-    def go[G[_], X, End](
-        scope: Scope[F],
-        extendedTopLevelScope: Option[Scope[F]],
-        translation: G ~> F,
-        runner: Run[G, X, F[End]],
-        stream: Pull[G, X, Unit]
-    ): F[End] = {
-
-      def interruptGuard(scope: Scope[F], view: Cont[Nothing, G, X])(next: => F[End]): F[End] =
-        scope.isInterrupted.flatMap {
-          case None => next
-          case Some(outcome) =>
-            val result = outcome match {
-              case Outcome.Errored(err)       => Fail(err)
-              case Outcome.Canceled()         => Interrupted(scope.id, None)
-              case Outcome.Succeeded(scopeId) => Interrupted(scopeId, None)
-            }
-            go(scope, extendedTopLevelScope, translation, runner, view(result))
-        }
-
-      def goErr(err: Throwable, view: Cont[Nothing, G, X]): F[End] =
-        go(scope, extendedTopLevelScope, translation, runner, view(Fail(err)))
-
-      class ViewRunner(val view: Cont[Unit, G, X]) extends Run[G, X, F[End]] {
-        private val prevRunner = runner
-
-        def done(doneScope: Scope[F]): F[End] =
-          go(doneScope, extendedTopLevelScope, translation, prevRunner, view(unit))
-
-        def out(head: Chunk[X], scope: Scope[F], tail: Pull[G, X, Unit]): F[End] = {
-          @tailrec
-          def outLoop(acc: Pull[G, X, Unit], pred: Run[G, X, F[End]]): F[End] =
-            // bit of an ugly hack to avoid a stack overflow when these accummulate
-            pred match {
-              case vrun: ViewRunner @unchecked => outLoop(bindView(acc, vrun.view), vrun.prevRunner)
-              case _                           => pred.out(head, scope, acc)
-            }
-          outLoop(tail, this)
-        }
-
-        def interrupted(inter: Interrupted): F[End] =
-          go(scope, extendedTopLevelScope, translation, prevRunner, view(inter))
-
-        def fail(e: Throwable): F[End] = goErr(e, view)
-      }
-
-      class TranslateRunner[H[_]](fk: H ~> G, view: Cont[Unit, G, X]) extends Run[H, X, F[End]] {
-        def done(doneScope: Scope[F]): F[End] =
-          go(doneScope, extendedTopLevelScope, translation, runner, view(unit))
-        def out(head: Chunk[X], scope: Scope[F], tail: Pull[H, X, Unit]): F[End] = {
-          val next = bindView(Translate(tail, fk), view)
-          runner.out(head, scope, next)
-        }
-        def interrupted(inter: Interrupted): F[End] =
-          go(scope, extendedTopLevelScope, translation, runner, view(inter))
-        def fail(e: Throwable): F[End] = goErr(e, view)
-      }
-
-      abstract class StepRunR[Y, S](view: Cont[Option[S], G, X]) extends Run[G, Y, F[End]] {
-        def done(scope: Scope[F]): F[End] =
-          interruptGuard(scope, view) {
-            go(scope, extendedTopLevelScope, translation, runner, view(Succeeded(None)))
-          }
-
-        def interrupted(inter: Interrupted): F[End] =
-          go(scope, extendedTopLevelScope, translation, runner, view(inter))
-
-        def fail(e: Throwable): F[End] = goErr(e, view)
-      }
-
-      class UnconsRunR[Y](view: Cont[Option[(Chunk[Y], Pull[G, Y, Unit])], G, X])
-          extends StepRunR[Y, (Chunk[Y], Pull[G, Y, Unit])](view) {
-
-        def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] =
-          // For a Uncons, we continue in same Scope at which we ended compilation of inner stream
-          interruptGuard(outScope, view) {
-            val result = Succeeded(Some((head, tail)))
-            go(outScope, extendedTopLevelScope, translation, runner, view(result))
-          }
-      }
-
-      class StepLegRunR[Y](view: Cont[Option[Stream.StepLeg[G, Y]], G, X])
-          extends StepRunR[Y, Stream.StepLeg[G, Y]](view) {
-
-        def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] =
-          // StepLeg: we shift back to the scope at which we were
-          // before we started to interpret the Leg's inner stream.
-          interruptGuard(scope, view) {
-            val result = Succeeded(Some(new Stream.StepLeg(head, outScope.id, tail)))
-            go(scope, extendedTopLevelScope, translation, runner, view(result))
-          }
-      }
-
-      class FlatMapR[Y](view: Cont[Unit, G, X], fun: Y => Pull[G, X, Unit])
-          extends Run[G, Y, F[End]] {
-        private[this] def unconsed(chunk: Chunk[Y], tail: Pull[G, Y, Unit]): Pull[G, X, Unit] =
-          if (chunk.size == 1 && tail.isInstanceOf[Succeeded[?]])
-            // nb: If tl is Pure, there's no need to propagate flatMap through the tail. Hence, we
-            // check if hd has only a single element, and if so, process it directly instead of folding.
-            // This allows recursive infinite streams of the form `def s: Stream[Pure,O] = Stream(o).flatMap { _ => s }`
-            try fun(chunk(0))
-            catch { case NonFatal(e) => Fail(e) }
-          else {
-            def go(idx: Int): Pull[G, X, Unit] =
-              if (idx == chunk.size)
-                tail.flatMapOutput(fun)
-              else {
-                try {
-                  var j = idx
-                  @tailrec
-                  def loop: Pull[G, X, Unit] = fun(chunk(j)) match {
-                    case Succeeded(_) if j < chunk.size - 1 =>
-                      j += 1
-                      loop
-                    case p => p
-                  }
-
-                  val next: Pull[G, X, Unit] = loop
-                  transformWith(next) {
-                    case Succeeded(_) => go(j + 1)
-                    case Fail(err)    => Fail(err)
-                    case interruption @ Interrupted(_, _) =>
-                      interruptBoundary(tail, interruption).flatMapOutput(fun)
-                  }
-                } catch { case NonFatal(e) => Fail(e) }
-              }
-
-            go(0)
-          }
-
-        def done(scope: Scope[F]): F[End] =
-          interruptGuard(scope, view) {
-            go(scope, extendedTopLevelScope, translation, runner, view(unit))
-          }
-
-        def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] = {
-          val next = bindView(unconsed(head, tail), view)
-          go(outScope, extendedTopLevelScope, translation, runner, next)
-        }
-
-        def interrupted(inter: Interrupted): F[End] =
-          go(scope, extendedTopLevelScope, translation, runner, view(inter))
-
-        def fail(e: Throwable): F[End] = goErr(e, view)
-      }
-
-      def goEval[V](eval: Eval[G, V], view: Cont[V, G, X]): F[End] =
-        scope.interruptibleEval(translation(eval.value)).flatMap { eitherOutcome =>
-          val result = eitherOutcome match {
-            case Right(r)                       => Succeeded(r)
-            case Left(Outcome.Errored(err))     => Fail(err)
-            case Left(Outcome.Canceled())       => Interrupted(scope.id, None)
-            case Left(Outcome.Succeeded(token)) => Interrupted(token, None)
-          }
-          go(scope, extendedTopLevelScope, translation, runner, view(result))
-        }
-
-      def goAcquire[R](acquire: Acquire[G, R], view: Cont[R, G, X]): F[End] = {
-        val onScope = scope.acquireResource[R](
-          poll =>
-            if (acquire.cancelable) poll(translation(acquire.resource))
-            else translation(acquire.resource),
-          (resource, exit) => translation(acquire.release(resource, exit))
-        )
-        val cont = onScope.flatMap { outcome =>
-          val result = outcome match {
-            case Outcome.Succeeded(Right(r))      => Succeeded(r)
-            case Outcome.Succeeded(Left(scopeId)) => Interrupted(scopeId, None)
-            case Outcome.Canceled()               => Interrupted(scope.id, None)
-            case Outcome.Errored(err)             => Fail(err)
-          }
-          go(scope, extendedTopLevelScope, translation, runner, view(result))
-        }
-        interruptGuard(scope, view)(cont)
-      }
-
-      def goInterruptWhen(
-          haltOnSignal: F[Either[Throwable, Unit]],
-          view: Cont[Unit, G, X]
-      ): F[End] = {
-        val onScope = scope.acquireResource(
-          _ => scope.interruptWhen(haltOnSignal),
-          (f: Fiber[F, Throwable, Unit], _: ExitCase) => f.cancel
-        )
-        val cont = onScope.flatMap { outcome =>
-          val result = outcome match {
-            case Outcome.Succeeded(Right(_))      => unit
-            case Outcome.Succeeded(Left(scopeId)) => Interrupted(scopeId, None)
-            case Outcome.Canceled()               => Interrupted(scope.id, None)
-            case Outcome.Errored(err)             => Fail(err)
-          }
-          go(scope, extendedTopLevelScope, translation, runner, view(result))
-        }
-        interruptGuard(scope, view)(cont)
-      }
-
-      def goInScope(
-          stream: Pull[G, X, Unit],
-          useInterruption: Boolean,
-          view: Cont[Unit, G, X]
-      ): F[End] = {
-        def endScope(scopeId: Unique.Token, result: Terminal[Unit]): Pull[G, X, Unit] =
-          result match {
-            case Succeeded(_)              => SucceedScope(scopeId)
-            case inter @ Interrupted(_, _) => CanceledScope(scopeId, inter)
-            case Fail(err)                 => FailedScope(scopeId, err)
-          }
-
-        val maybeCloseExtendedScope: F[Option[Scope[F]]] =
-          // If we're opening a new top-level scope (aka, direct descendant of root),
-          // close the current extended top-level scope if it is defined.
-          if (scope.isRoot && extendedTopLevelScope.isDefined)
-            extendedTopLevelScope.traverse_(_.close(ExitCase.Succeeded).rethrow).as(None)
-          else
-            F.pure(extendedTopLevelScope)
-
-        val tail = maybeCloseExtendedScope.flatMap { newExtendedScope =>
-          scope.open(useInterruption).rethrow.flatMap { childScope =>
-            val bb = new Bind[G, X, Unit, Unit](stream) {
-              def cont(r: Terminal[Unit]): Pull[G, X, Unit] = endScope(childScope.id, r)
-            }
-            go(childScope, newExtendedScope, translation, new ViewRunner(view), bb)
-          }
-        }
-        interruptGuard(scope, view)(tail)
-      }
-
-      def goCloseScope(close: CloseScope, view: Cont[Unit, G, X]): F[End] = {
-        def addError(err: Throwable, res: Terminal[Unit]): Terminal[Unit] = res match {
-          case Succeeded(_) => Fail(err)
-          case Fail(err0)   => Fail(CompositeFailure(err, err0, Nil))
-          // Note: close.interruption.isSome IF-AND-ONLY-IF close.exitCase is ExitCase.Cancelled
-          case Interrupted(_, _) => sys.error(s"Impossible, cannot interrupt here")
-        }
-
-        def viewCont(res: Terminal[Unit]): Pull[G, X, Unit] =
-          close.exitCase match {
-            case ExitCase.Errored(err) => view(addError(err, res))
-            case _                     => view(res)
-          }
-
-        def closeTerminal(r: Either[Throwable, Unit], ancestor: Scope[F]): Terminal[Unit] =
-          close.interruption match {
-            case None => r.fold(Fail(_), Succeeded(_))
-            case Some(Interrupted(interruptedScopeId, err)) =>
-              def err1 = CompositeFailure.fromList(r.swap.toOption.toList ++ err.toList)
-              if (ancestor.descendsFrom(interruptedScopeId))
-                // we still have scopes to interrupt, lets build interrupted tail
-                Interrupted(interruptedScopeId, err1)
-              else
-                // interrupts scope was already interrupted, resume operation
-                err1 match {
-                  case None     => unit
-                  case Some(e2) => Fail(e2)
-                }
-          }
-
-        scope.findInLineage(close.scopeId).flatMap {
-          case Some(toClose) if toClose.isRoot =>
-            // Impossible - don't close root scope as a result of a `CloseScope` call
-            go(scope, extendedTopLevelScope, translation, runner, viewCont(unit))
-
-          case Some(toClose) if extendLastTopLevelScope && toClose.level == 1 =>
-            // Request to close the current top-level scope - if we're supposed to extend
-            // it instead, leave the scope open and pass it to the continuation
-            extendedTopLevelScope.traverse_(_.close(ExitCase.Succeeded).rethrow) *>
-              toClose.openAncestor.flatMap { ancestor =>
-                go(ancestor, Some(toClose), translation, runner, viewCont(unit))
-              }
-
-          case Some(toClose) =>
-            toClose.close(close.exitCase).flatMap { r =>
-              toClose.openAncestor.flatMap { ancestor =>
-                val res = closeTerminal(r, ancestor)
-                go(ancestor, extendedTopLevelScope, translation, runner, viewCont(res))
-              }
-            }
-
-          case None =>
-            // scope already closed, continue with current scope
-            val result = close.interruption.getOrElse(unit)
-            go(scope, extendedTopLevelScope, translation, runner, viewCont(result))
-        }
-      }
-
-      (viewL(stream): @unchecked) match { // unchecked b/c scala 3 erroneously reports exhaustiveness warning
-        case tst: Translate[h, G, ?] @unchecked => // y = Unit
-          val translateRunner: Run[h, X, F[End]] = new TranslateRunner(tst.fk, getCont())
-          val composed: h ~> F = translation.compose(tst.fk)
-          go(scope, extendedTopLevelScope, composed, translateRunner, tst.stream)
-
-        case output: Output[?] =>
-          val view = getCont()
-          interruptGuard(scope, view)(
-            runner.out(output.values, scope, view(unit))
-          )
-
-        case fmout: FlatMapOutput[G, z, ?] => // y = Unit
-          val fmrunr = new FlatMapR(getCont(), fmout.fun)
-          F.unit >> go(scope, extendedTopLevelScope, translation, fmrunr, fmout.stream)
-
-        case u: Uncons[G, y] @unchecked =>
-          val v = getCont()
-          // a Uncons is run on the same scope, without shifting.
-          val runr = buildR[G, y, End]
-          F.unit >> go(scope, extendedTopLevelScope, translation, runr, u.stream).attempt
-            .flatMap(_.fold(goErr(_, v), _.apply(new UnconsRunR(v))))
-
-        case s: StepLeg[G, y] @unchecked =>
-          val v = getCont()
-          val runr = buildR[G, y, End]
-          scope
-            .shiftScope(s.scope, s.toString)
-            .flatMap(go(_, extendedTopLevelScope, translation, runr, s.stream).attempt)
-            .flatMap(_.fold(goErr(_, v), _.apply(new StepLegRunR(v))))
-
-        case _: GetScope[?] =>
-          go(scope, extendedTopLevelScope, translation, runner, getCont()(Succeeded(scope)))
-        case eval: Eval[G, r]       => goEval[r](eval, getCont())
-        case acquire: Acquire[G, ?] => goAcquire(acquire, getCont())
-        case inScope: InScope[G, ?] =>
-          goInScope(inScope.stream, inScope.useInterruption, getCont())
-        case int: InterruptWhen[G] =>
-          goInterruptWhen(translation(int.haltOnSignal), getCont())
-        case close: CloseScope => goCloseScope(close, getCont())
-
-        case _: Succeeded[?]  => runner.done(scope)
-        case failed: Fail     => runner.fail(failed.error)
-        case int: Interrupted => runner.interrupted(int)
-      }
-    }
-
-    val initFk: F ~> F = cats.arrow.FunctionK.id[F]
-
-    class OuterRun(initB: B) extends Run[F, O, F[B]] { self =>
-      private[this] var accB: B = initB
-
-      override def done(scope: Scope[F]): F[B] = F.pure(accB)
-
-      override def fail(e: Throwable): F[B] = F.raiseError(e)
-
-      override def interrupted(inter: Interrupted): F[B] =
-        inter.deferredError.fold(F.pure(accB))(F.raiseError)
-
-      override def out(head: Chunk[O], scope: Scope[F], tail: Pull[F, O, Unit]): F[B] =
-        try {
-          accB = foldChunk(accB, head)
-          go(scope, None, initFk, self, tail)
-        } catch {
-          case NonFatal(e) =>
-            viewL(tail) match {
-              case _: Action[F, O, ?] =>
-                go(scope, None, initFk, self, getCont()(Fail(e)))
-              case Succeeded(_)        => F.raiseError(e)
-              case Fail(e2)            => F.raiseError(CompositeFailure(e2, e))
-              case Interrupted(_, err) => F.raiseError(err.fold(e)(t => CompositeFailure(e, t)))
-            }
-        }
-    }
-
-    go(initScope, None, initFk, new OuterRun(init), stream)
-  }
-
-  @deprecated("use the extension method", "3.4.0")
-  private[fs2] def flatMapOutput[F[_], F2[x] >: F[x], O, O2](
-      p: Pull[F, O, Unit],
-      f: O => Pull[F2, O2, Unit]
-  ): Pull[F2, O2, Unit] =
-    p.flatMapOutput(f)
-
-  private[fs2] def translate[F[_], G[_], O](
-      stream: Pull[F, O, Unit],
-      fK: F ~> G
-  ): Pull[G, O, Unit] =
-    stream match {
-      case t: Translate[?, f, ?] =>
-        translate(t.stream, t.fk.andThen(fK.asInstanceOf[f ~> G]))
-      case o: Output[?]   => o
-      case r: Terminal[?] => r
-      case _              => Translate(stream, fK)
-    }
-
-  /* Applies the outputs of this pull to `f` and returns the result in a new `Pull`. */
-  private[fs2] def mapOutput[F[_], O, P](s: Stream[F, O], f: O => P): Pull[F, P, Unit] =
-    interruptScope(mapOutputNoScope(s, f))
-
-  /** Like `mapOutput` but does not insert an interruption scope. */
-  private[fs2] def mapOutputNoScope[F[_], O, P](
-      s: Stream[F, O],
-      f: O => P
-  ): Pull[F, P, Unit] =
-    s.pull.echo.unconsFlatMap(hd => Pull.output(hd.map(f)))
-
-  private[this] def transformWith[F[_], O, R, S](p: Pull[F, O, R])(
-      f: Terminal[R] => Pull[F, O, S]
-  ): Pull[F, O, S] =
-    p match {
-      case r: Terminal[R] =>
-        try f(r)
-        catch { case NonFatal(e) => Fail(e) }
-      case _ =>
-        new Bind[F, O, R, S](p) {
-          def cont(r: Terminal[R]): Pull[F, O, S] =
-            try f(r)
-            catch { case NonFatal(e) => Fail(e) }
-        }
-    }
-
-  /** Provides syntax for pure pulls based on `cats.Id`. */
-  implicit final class IdOps[O](private val self: Pull[Id, O, Unit]) extends AnyVal {
-    private def idToApplicative[F[_]: Applicative]: Id ~> F =
-      new (Id ~> F) { def apply[A](a: Id[A]) = a.pure[F] }
-
-    def covaryId[F[_]: Applicative]: Pull[F, O, Unit] = Pull.translate(self, idToApplicative[F])
-  }
-}
+// sealed abstract class Pull[+F[_], +O, +R] {
+
+//   /** Applies the result of this pull to `f` and returns the result.
+//     *
+//     * This method returns a new composed pull, which will do as follows:
+//     *
+//     * - If `this` pull succeeds with a result `r` of type R, the `f` function
+//     *   is applied to `r`, to build a new pull `f(r)`, and the result pull
+//     *   starts running that new pull. The composed pull will terminate (or not)
+//     *   just as the new pull `f(r)` does.
+//     * - If `this` pull fails or is interrupted, then the composed pull
+//     *   terminates with that same failure or interruption.
+//     * - If evaluating `f(r)` to build the pull throws an exception, the result
+//     *   is a pull that fails with that exception.
+//     *
+//     * The composed pull emits all outputs emitted by `this` pull,
+//     * and if successful will start emitting the outputs from the generated pull.
+//     *
+//     * This operation does not modify resource scope boundaries. The generated
+//     * `post` pull starts running on the same scope in which `this` pull ended,
+//     * and the composed pull will end on the same scope in which `post` pull does.
+//     */
+//   def flatMap[F2[x] >: F[x], O2 >: O, R2](f: R => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
+//     new Bind[F2, O2, R, R2](this) {
+//       def cont(e: Terminal[R]): Pull[F2, O2, R2] =
+//         e match {
+//           case Succeeded(r) =>
+//             try f(r)
+//             catch { case NonFatal(e) => Fail(e) }
+//           case res @ Interrupted(_, _) => res
+//           case res @ Fail(_)           => res
+//         }
+//     }
+
+//   /** Lazily appends the given `post` pull, to be run after `this` pull.
+//     *
+//     * - If `this` pull succeeds, then its result is discarded, the `post`
+//     *   pull is built, and starts running. The result of `post` is
+//     *   the result of the composed pull.
+//     *
+//     * - If `this` pull raises an error or is interrupted, the `post` argument is
+//     *   not evaluated and the composed pull ends just as `this` pull did.
+//     *
+//     * In both cases, the effectful actions and outputs of the appended pull
+//     * consists of those outputs and actions from the first pull, followed by
+//     * those from the `post` pull, in the same order as they would come out of each pull.
+//     *
+//     * Since the `post` argument is lazy, this method can be used to build lazy
+//     * pulls, which are not built in memory until after the prefix has run.
+//     * This allows defining pulls recursively.
+//     *
+//     * This operation does not add or remove any resource scope boundaries.
+//     * The `post` pull runs on the same scope in which `this` pull ended.
+//     * The composed pull ends on whatever scope the `post` pull does.
+//     *
+//     * This is equivalent to `.flatMap(_ => post)`
+//     */
+//   def >>[F2[x] >: F[x], O2 >: O, S](post: => Pull[F2, O2, S]): Pull[F2, O2, S] =
+//     new Bind[F2, O2, R, S](this) {
+//       def cont(r: Terminal[R]): Pull[F2, O2, S] =
+//         r match {
+//           case _: Succeeded[?] => post
+//           case r: Interrupted  => r
+//           case r: Fail         => r
+//         }
+//     }
+
+//   /** Alias for `flatMap(r => Pull.eval(f(r)))`. */
+//   def evalMap[F2[x] >: F[x], R2](f: R => F2[R2]): Pull[F2, O, R2] =
+//     flatMap(r => Pull.eval(f(r)))
+
+//   /** Allows to recover from any error raised by the evaluation of this pull.
+//     * This method returns a composed pull with the following semantics:
+//     * - If an error occurs, the supplied function is used to build a new handler
+//     *   pull, and it starts running it. However, the pull cannot be resumed from
+//     *   the point at which the error arose.
+//     * - If no error is raised, the resulting pull just does what `this` pull does.
+//     */
+//   def handleErrorWith[F2[x] >: F[x], O2 >: O, R2 >: R](
+//       handler: Throwable => Pull[F2, O2, R2]
+//   ): Pull[F2, O2, R2] =
+//     new Bind[F2, O2, R2, R2](this) {
+//       def cont(term: Terminal[R2]): Pull[F2, O2, R2] =
+//         term match {
+//           case Fail(e) =>
+//             try handler(e)
+//             catch { case NonFatal(e) => Fail(e) }
+//           case other => other
+//         }
+//     }
+
+//   /** Run `post` after `this`, regardless of errors during `this`:
+//     *
+//     * - If `this` pull terminates successfully, then its result is discarded
+//     *   and the `post` pull is run. However the `post` pull ends, be it in
+//     *   success, error, interruption, is how the combined pull ends.
+//     *
+//     * - If `this` pull fails, the `post` pull is run next. If the `post` pull
+//     *   ends, fails, or is interrupted, that is how the combined pull ends.
+//     *   However, if the `post` pull succeeds, then the combined `onComplete` pull
+//     *   fails again with the error that was raised from `this` pull.
+//     *
+//     * - If `this` pull is interrupted, then the `post` pull is never run
+//     *   and the combined pull ends with that same interruption.
+//     */
+//   def onComplete[F2[x] >: F[x], O2 >: O, R2](post: => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
+//     handleErrorWith(e => post >> Fail(e)) >> post
+
+//   /** Short-hand for `(this: Pull[F2, P, S])`. Used to assist with type inference. */
+//   def covaryAll[F2[x] >: F[x], O2 >: O, R2 >: R]: Pull[F2, O2, R2] = this
+
+//   /** Short-hand for `(this: Pull[F2, O, R])`. Used to assist with type inference. */
+//   def covary[F2[x] >: F[x]]: Pull[F2, O, R] = this
+
+//   /** Short-hand for `(this: Pull[F, O2, R])`. Used to assist with type inference. */
+//   def covaryOutput[O2 >: O]: Pull[F, O2, R] = this
+
+//   /** Short-hand for `(this: Pull[F, O, R2])`. Used to assist with type inference. */
+//   def covaryResult[R2 >: R]: Pull[F, O, R2] = this
+
+//   /** Returns a pull with the result wrapped in `Right`,
+//     * or an error wrapped in `Left` if the pull has raised an error.
+//     * If `this` pull is interrupted, the attempted pull ends the same way.
+//     */
+//   def attempt: Pull[F, O, Either[Throwable, R]] =
+//     map(r => Right(r)).handleErrorWith(t => Succeeded(Left(t)))
+
+//   /** Maps the result of this pull with the `f` mapping function.
+//     *
+//     * If `this` pull ends in success with a result `r`, then the function `f`
+//     * is applied to its result `r`, and the image `f(r)` is the result of the
+//     * mapped pull. However, if the evaluation of `f(r)` throws an error, the
+//     * mapped pull fails with that error.
+//     *
+//     * Note: for some simple cases of Pull, the `map` function may be eagerly
+//     * applied, or discarded, _before_ the pull starts being run.
+//     *
+//     * If `this` pull terminates abnormally, so does the mapped pull.
+//     */
+//   def map[S](f: R => S): Pull[F, O, S] =
+//     new Bind[F, O, R, S](this) {
+//       def cont(r: Terminal[R]) = r.map(f)
+//     }
+
+//   /** Discards the result of this pull.
+//     *
+//     * If `this` pull ends in success, its result is discarded and the _voided_
+//     * pull returns the unit `()` value. Otherwise, the voided pull just does
+//     * the same as `this` pull does.
+//     *
+//     * Alias for `this.map(_ => ())`.
+//     */
+//   def void: Pull[F, O, Unit] = as(())
+
+//   /** Replaces the result of this pull with the given constant value.
+//     * If `this` pull succeeds, then its result is discarded and the resulting
+//     * pull succeeds with the `s` value as its result.
+//     * Otherwise, if `this` pull fails or is interrupted, then the result pull
+//     * ends the same way.
+//     *
+//     * Alias for `_.map(_ => o2)`.
+//     *
+//     * @tparam S The type of the constant,
+//     * @param  s The new result value of the pull
+//     */
+//   def as[S](s: S): Pull[F, O, S] = map(_ => s)
+
+//   /** Leases all resources that are currently open, canceling the lease at the
+//     * termination of this pull.
+//     */
+//   def lease: Pull[F, O, R] =
+//     Pull.bracketCase[F, O, Lease[F], R](
+//       Pull.getScope[F].evalMap(_.lease),
+//       _ => this,
+//       (l, _) => Pull.eval(l.cancel).rethrow
+//     )
+// }
+
+// object Pull extends PullLowPriority {
+
+//   implicit final class StreamPullOps[F[_], O](private val self: Pull[F, O, Unit]) extends AnyVal {
+
+//     /** Interprets this pull to produce a stream. This method introduces a resource
+//       * scope, to ensure any resources acquired by this pull are released in due
+//       * course, even if the resulting stream does not terminate successfully.
+//       *
+//       * May only be called on pulls which return a `Unit` result type. Use
+//       * `p.void.stream` to explicitly ignore the result type of the pull.
+//       */
+//     def stream: Stream[F, O] = new Stream(Pull.scope(self))
+
+//     /** Interpret this `Pull` to produce a `Stream` without introducing a scope.
+//       *
+//       * Only use this if you know a scope is not needed. Scope introduction is
+//       *
+//       * generally harmless and the risk of not introducing a scope is a memory leak
+//       * in streams that otherwise would execute in constant memory.
+//       *
+//       * May only be called on pulls whose result type is `Unit`.
+//       * Use `p.void.stream` to explicitly ignore the result of a pull.
+//       */
+//     def streamNoScope: Stream[F, O] = new Stream(self)
+
+//     private[fs2] def flatMapOutput[F2[x] >: F[x], O2](
+//         f: O => Pull[F2, O2, Unit]
+//     ): Pull[F2, O2, Unit] =
+//       self match {
+//         case a: AlgEffect[F, Unit] => a
+//         case r: Terminal[?]        => r
+//         case _                     => FlatMapOutput(self, f)
+//       }
+
+//     private[fs2] def unconsFlatMap[F2[x] >: F[x], O2](
+//         f: Chunk[O] => Pull[F2, O2, Unit]
+//     ): Pull[F2, O2, Unit] =
+//       uncons.flatMap {
+//         case None           => Pull.done
+//         case Some((hd, tl)) => f(hd) >> tl.unconsFlatMap(f)
+//       }
+
+//     /* Pull transformation that takes the given stream (pull), unrolls it until it either:
+//      * - Reaches the end of the stream, and returns None; or
+//      * - Reaches an Output action, and emits Some pair with
+//      *   the non-empty chunk of values and the rest of the stream.
+//      */
+//     private[fs2] def uncons: Pull[F, Nothing, Option[(Chunk[O], Pull[F, O, Unit])]] =
+//       self match {
+//         case Succeeded(_)    => Succeeded(None)
+//         case Output(vals)    => Succeeded(Some(vals -> unit))
+//         case ff: Fail        => ff
+//         case it: Interrupted => it
+//         case _               => Uncons(self)
+//       }
+
+//   }
+
+//   private[this] val unit: Terminal[Unit] = Succeeded(())
+
+//   private[fs2] val outUnit: Pull[Pure, Unit, Unit] = Output(Chunk.unit)
+
+//   /** A pull that performs no effects, emits no outputs, and
+//     * always terminates successfully with a unit result.
+//     */
+//   val done: Pull[Nothing, Nothing, Unit] = unit
+
+//   /** Creates an pull that performs no effects, emits no outputs,
+//     * and terminates successfully with the supplied value as its result.
+//     */
+//   def pure[F[_], R](r: R): Pull[F, Nothing, R] = Succeeded(r)
+
+//   /** Lifts a throwable error into an atomic pull that emits no outputs and
+//     * fails with the given error, without any result.
+//     *
+//     * The `F` type must be explicitly provided (e.g., via `raiseError[IO]`
+//     * or `raiseError[Fallible]`).
+//     */
+//   def raiseError[F[_]: RaiseThrowable](err: Throwable): Pull[F, Nothing, Nothing] = Fail(err)
+
+//   /** Creates a pull that evaluates the supplied effect `fr`, emits no
+//     * outputs, and terminates with the result of the effect.
+//     * If the `fr` effect fails with an error, the new pull fails with that error.
+//     */
+//   def eval[F[_], R](fr: F[R]): Pull[F, Nothing, R] = Eval[F, R](fr)
+
+//   /** Creates a pull that waits for the duration `d` */
+//   def sleep[F[_]](d: FiniteDuration)(implicit t: Temporal[F]): Pull[F, Nothing, Unit] =
+//     Pull.eval(t.sleep(d))
+
+//   /** Lifts the given output value `O` into a pull that performs no
+//     * effects, emits that single output in a singleton chunk, and always
+//     * terminates successfully with a unit result.
+//     *
+//     * _Note_: using singleton chunks is not efficient. If possible,
+//     * use the chunk-based `output` method instead.
+//     */
+//   def output1[F[_], O](o: O): Pull[F, O, Unit] = Output(Chunk.singleton(o))
+
+//   /** Lifts the given optional value `O` into a pull that performs no
+//     * effects, emits the content of that option, and always
+//     * terminates successfully with a unit result.
+//     */
+//   def outputOption1[F[_], O](opt: Option[O]): Pull[F, O, Unit] =
+//     opt.map(output1).getOrElse(done)
+
+//   /** Creates a pull that emits the elements of the given chunk.
+//     * The new pull performs no effects and terminates successfully with a unit result.
+//     */
+//   def output[F[_], O](os: Chunk[O]): Pull[F, O, Unit] =
+//     if (os.isEmpty) Pull.done else Output[O](os)
+
+//   private[fs2] def acquire[F[_], R](
+//       resource: F[R],
+//       release: (R, ExitCase) => F[Unit]
+//   ): Pull[F, Nothing, R] =
+//     Acquire(resource, release, cancelable = false)
+
+//   private[fs2] def acquireCancelable[F[_], R](
+//       resource: Poll[F] => F[R],
+//       release: (R, ExitCase) => F[Unit]
+//   )(implicit F: MonadCancel[F, ?]): Pull[F, Nothing, R] =
+//     Acquire(F.uncancelable(resource), release, cancelable = true)
+
+//   /** Like [[eval]] but if the effectful value fails, the exception is returned
+//     * in a `Left` instead of failing the pull.
+//     */
+//   def attemptEval[F[_], R](fr: F[R]): Pull[F, Nothing, Either[Throwable, R]] =
+//     Eval[F, R](fr)
+//       .map(r => Right(r): Either[Throwable, R])
+//       .handleErrorWith(t => Succeeded[Either[Throwable, R]](Left(t)))
+
+//   def bracketCase[F[_], O, A, B](
+//       acquire: Pull[F, O, A],
+//       use: A => Pull[F, O, B],
+//       release: (A, ExitCase) => Pull[F, O, Unit]
+//   ): Pull[F, O, B] =
+//     acquire.flatMap { a =>
+//       val used =
+//         try use(a)
+//         catch { case NonFatal(t) => Fail(t) }
+//       transformWith(used) { result =>
+//         val exitCase: ExitCase = result match {
+//           case Succeeded(_)      => ExitCase.Succeeded
+//           case Fail(err)         => ExitCase.Errored(err)
+//           case Interrupted(_, _) => ExitCase.Canceled
+//         }
+
+//         transformWith(release(a, exitCase)) {
+//           case Fail(t2) =>
+//             result match {
+//               case Fail(tres) => Fail(CompositeFailure(tres, t2))
+//               case result     => result
+//             }
+//           case _ => result
+//         }
+//       }
+//     }
+
+//   /** Extends the scope of the currently open resources to the specified stream,
+//     * preventing them from being finalized until after `s` completes execution,
+//     * even if the returned pull is converted to a stream, compiled, and
+//     * evaluated before `s` is compiled and evaluated.
+//     */
+//   def extendScopeTo[F[_], O](
+//       s: Stream[F, O]
+//   )(implicit F: MonadError[F, Throwable]): Pull[F, Nothing, Stream[F, O]] =
+//     for {
+//       scope <- Pull.getScope[F]
+//       lease <- Pull.eval(scope.lease)
+//     } yield s.onFinalize(lease.cancel.redeemWith(F.raiseError(_), _ => F.unit))
+
+//   /** Repeatedly uses the output of the pull as input for the next step of the
+//     * pull. Halts when a step terminates with `None` or `Pull.raiseError`.
+//     */
+//   def loop[F[_], O, R](f: R => Pull[F, O, Option[R]]): R => Pull[F, O, Unit] =
+//     (r: R) =>
+//       f(r).flatMap {
+//         case None    => Pull.done
+//         case Some(s) => loop(f)(s)
+//       }
+
+//   /** Intantiates with a state. Repeatedly uses the left value of the result of
+//     * the pull as input for the next step. The Pull terminates when a step terminates with
+//     * `Right` or `Pull.raiseError`.
+//     */
+//   def loopEither[F[_], O, S, R](f: S => Pull[F, O, Either[S, R]]): S => Pull[F, O, R] =
+//     (s: S) =>
+//       f(s).flatMap {
+//         case Left(ns) => loopEither(f)(ns)
+//         case Right(r) => Pull.pure(r)
+//       }
+
+//   private[fs2] def fail[F[_]](err: Throwable): Pull[F, Nothing, Nothing] = Fail(err)
+
+//   final class PartiallyAppliedFromEither[F[_]] {
+//     def apply[A](either: Either[Throwable, A])(implicit ev: RaiseThrowable[F]): Pull[F, A, Unit] =
+//       either.fold(raiseError[F], output1)
+//   }
+
+//   /** Lifts an Either[Throwable, A] to an effectful Pull[F, A, Unit].
+//     *
+//     * @example {{{
+//     * scala> import cats.effect.SyncIO, scala.util.Try
+//     * scala> Pull.fromEither[SyncIO](Right(42)).stream.compile.toList.unsafeRunSync()
+//     * res0: List[Int] = List(42)
+//     * scala> Try(Pull.fromEither[SyncIO](Left(new RuntimeException)).stream.compile.toList.unsafeRunSync())
+//     * res1: Try[List[Nothing]] = Failure(java.lang.RuntimeException)
+//     * }}}
+//     */
+//   def fromEither[F[x]] = new PartiallyAppliedFromEither[F]
+
+//   /** Gets the current scope, allowing manual leasing or interruption.
+//     * This is a low-level method and generally should not be used by user code.
+//     */
+//   private[fs2] def getScope[F[_]]: Pull[F, Nothing, Scope[F]] = GetScope[F]()
+
+//   /** Returns a pull that evaluates the supplied by-name each time the pull is
+//     * used, allowing use of a mutable value in pull computations.
+//     */
+//   def suspend[F[_], O, R](p: => Pull[F, O, R]): Pull[F, O, R] =
+//     new Bind[F, O, Unit, R](unit) {
+//       def cont(r: Terminal[Unit]): Pull[F, O, R] = p
+//     }
+
+//   /** An abstraction for writing `Pull` computations that can timeout
+//     * while reading from a `Stream`.
+//     *
+//     * A `Pull.Timed` is not created or intepreted directly, but by
+//     * calling [[Stream.ToPull.timed]].
+//     *
+//     * {{{
+//     * yourStream.pull.timed(tp => ...).stream
+//     * }}}
+//     *
+//     * The argument to `timed` is a `Pull.Timed[F, O] => Pull[F, O2, R]`
+//     * function, which describes the pulling logic and is often recursive,
+//     * with shape:
+//     *
+//     * {{{
+//     * def go(timedPull: Pull.Timed[F, A]): Pull[F, B, Unit] =
+//     *   timedPull.uncons.flatMap {
+//     *     case Some((Right(chunk), next)) => doSomething >> go(next)
+//     *     case Some((Left(_), next)) => doSomethingElse >> go(next)
+//     *     case None => Pull.done
+//     *   }
+//     * }}}
+//     *
+//     * Where `doSomething` and `doSomethingElse` are `Pull` computations
+//     * such as `Pull.output`, in addition to `Pull.Timed.timeout`.
+//     *
+//     * See below for detailed descriptions of `timeout` and `uncons`, and
+//     * look at the [[Stream.ToPull.timed]] scaladoc for an example of usage.
+//     */
+//   trait Timed[F[_], O] {
+//     type Timeout
+
+//     /** Waits for either a chunk of elements to be available in the
+//       * source stream, or a timeout to trigger. Whichever happens
+//       * first is provided as the resource of the returned pull,
+//       * alongside a new timed pull that can be used for awaiting
+//       * again. A `None` is returned as the resource of the pull upon
+//       * reaching the end of the stream.
+//       *
+//       * Receiving a timeout is not a fatal event: the evaluation of the
+//       * current chunk is not interrupted, and the next timed pull is
+//       * still returned for further iteration. The lifetime of timeouts
+//       * is handled by explicit calls to the `timeout` method: `uncons`
+//       * does not start, restart or cancel any timeouts.
+//       *
+//       * Note that the type of timeouts is existential in `Pull.Timed`
+//       * (hidden, basically) so you cannot do anything on it except for
+//       * pattern matching, which is best done as a `Left(_)` case.
+//       */
+//     def uncons: Pull[F, Nothing, Option[(Either[Timeout, Chunk[O]], Pull.Timed[F, O])]]
+
+//     /** Asynchronously starts a timeout that will be received by
+//       * `uncons` after `t`, and immediately returns.
+//       *
+//       * Timeouts are resettable: if `timeout` executes whilst a
+//       * previous timeout is pending, it will cancel it before starting
+//       * the new one, so that there is at most one timeout in flight at
+//       * any given time. The implementation guards against stale
+//       * timeouts: after resetting a timeout, a subsequent `uncons` is
+//       * guaranteed to never receive an old one.
+//       *
+//       * Timeouts can be reset to any `t`, longer or shorter than the
+//       * previous timeout, but a duration of 0 is treated specially, in
+//       * that it will cancel a pending timeout but not start a new one.
+//       *
+//       * Note:
+//       * If for some reason you insert a pause in between `uncons` and
+//       * `timeout`, such as:
+//       * {{{
+//       * timedPull.timeout(n.millis) >>
+//       *   Pull.eval(IO.sleep(m.millis)) >>
+//       *   timedPull.uncons.flatMap { ...
+//       * }}}
+//       *
+//       * you should be aware that an invocation of `timeout` that
+//       * happens before the very first `uncons` will start the timeout
+//       * simultaneously with the very first `uncons`. Subsequent
+//       * invocations of `timeout` start the timeout immediately
+//       * instead.
+//       *
+//       * This is an implementation detail which should not affect most
+//       * cases, given that usually there is no need to sleep in between
+//       * `timeout` and the very first call to `uncons`.
+//       */
+//     def timeout(t: FiniteDuration): Pull[F, Nothing, Unit]
+//   }
+
+//   /** `Sync` instance for `Pull`. */
+//   implicit def syncInstance[F[_]: Sync, O]: Sync[Pull[F, O, *]] =
+//     new PullSyncInstance[F, O]
+
+//   /** `FunctionK` instance for `F ~> Pull[F, Nothing, *]`
+//     *
+//     * @example {{{
+//     * scala> import cats.Id
+//     * scala> Pull.functionKInstance[Id](42).flatMap(Pull.output1).stream.compile.toList
+//     * res0: cats.Id[List[Int]] = List(42)
+//     * }}}
+//     */
+//   implicit def functionKInstance[F[_]]: F ~> Pull[F, Nothing, *] =
+//     new (F ~> Pull[F, Nothing, *]) {
+//       def apply[X](fx: F[X]) = Pull.eval(fx)
+//     }
+
+//   /* Implementation notes:
+//    *
+//    * A Pull can be one of the following:
+//    *  - A Terminal - the end result of pulling. This may have ended in:
+//    *    - Succeeded with a result of type R.
+//    *    - Failed with an exception
+//    *    - Interrupted from another thread with a known `scopeId`
+//    *
+//    *  - A Bind, that binds a first computation(another Pull) with a method to _continue_
+//    *    the computation from the result of the first one `step`.
+//    *
+//    *  - A single Action, which can be one of following:
+//    *
+//    *    - Eval (or lift) an effectful operation of type `F[R]`
+//    *    - Output some values of type O.
+//    *    - Acquire a new resource and add its cleanup to the current scope.
+//    *    - Open, Close, or Access to the resource scope.
+//    *    - side-Step or fork to a different computation
+//    */
+
+//   /* A Terminal indicates how a pull evaluation ended.
+//    * A pull may have succeeded with a result, failed with an exception,
+//    * or interrupted from another concurrent pull.
+//    */
+//   private sealed abstract class Terminal[+R]
+//       extends Pull[Nothing, Nothing, R]
+//       with ViewL[Nothing, Nothing]
+
+//   private final case class Succeeded[+R](r: R) extends Terminal[R] {
+//     override def map[R2](f: R => R2): Terminal[R2] =
+//       try Succeeded(f(r))
+//       catch { case NonFatal(err) => Fail(err) }
+//   }
+
+//   private final case class Fail(error: Throwable) extends Terminal[Nothing] {
+//     override def map[R](f: Nothing => R): Terminal[R] = this
+//   }
+
+//   /** Signals that pull evaluation was interrupted.
+//     *
+//     * @param context Any user specific context that needs to be captured
+//     *                during interruption for eventual resume of the operation.
+//     *
+//     * @param deferredError Any errors, accumulated during resume of the interruption.
+//     *                      Instead throwing errors immediately during interruption,
+//     *                      signalling of the errors may be deferred until the Interruption resumes.
+//     */
+//   private final case class Interrupted(context: Unique.Token, deferredError: Option[Throwable])
+//       extends Terminal[Nothing] {
+//     override def map[R](f: Nothing => R): Terminal[R] = this
+//   }
+
+//   private sealed trait ContP[-Y, +F[_], +O, +X] extends (Terminal[Y] => Pull[F, O, X]) {
+//     def apply(r: Terminal[Y]): Pull[F, O, X] = cont(r)
+//     protected def cont(r: Terminal[Y]): Pull[F, O, X]
+//   }
+
+//   private object IdContP extends ContP[Unit, Nothing, Nothing, Unit] {
+//     def cont(r: Terminal[Unit]): Pull[Nothing, Nothing, Unit] = r
+//   }
+
+//   private abstract class Bind[+F[_], +O, X, +R](val step: Pull[F, O, X])
+//       extends Pull[F, O, R]
+//       with ContP[X, F, O, R] {
+//     def cont(r: Terminal[X]): Pull[F, O, R]
+//     def delegate: Bind[F, O, X, R] = this
+//   }
+
+//   /* Unrolled view of a `Pull` structure. */
+//   private sealed trait ViewL[+F[_], +O]
+
+//   // This class is not created by the combinators in the public Pull API, only during compilation
+//   private class DelegateBind[F[_], O, Y](
+//       step: Pull[F, O, Y],
+//       override val delegate: Bind[F, O, Y, Unit]
+//   ) extends Bind[F, O, Y, Unit](step) {
+//     def cont(yr: Terminal[Y]): Pull[F, O, Unit] = delegate.cont(yr)
+//   }
+
+//   private def bindView[F[_], O, Y](
+//       fmoc: Pull[F, O, Unit],
+//       view: Cont[Unit, F, O]
+//   ): Pull[F, O, Unit] =
+//     view match {
+//       case IdContP => fmoc
+//       case bv: Bind[F, O, Unit, Unit] @unchecked =>
+//         fmoc match {
+//           case r: Terminal[Unit] =>
+//             try bv(r)
+//             catch { case NonFatal(e) => Fail(e) }
+//           case _ => new DelegateBind[F, O, Unit](fmoc, bv.delegate)
+//         }
+//       case _ =>
+//         new Bind[F, O, Unit, Unit](fmoc) {
+//           def cont(r: Terminal[Unit]) = view(r)
+//         }
+//     }
+
+//   // This class is not created by combinators in public Pull API, only during compilation
+//   private class BindBind[F[_], O, X, Y](
+//       step: Pull[F, O, X],
+//       val bb: Bind[F, O, X, Y],
+//       val del: Bind[F, O, Y, Unit]
+//   ) extends Bind[F, O, X, Unit](step) {
+//     def cont(tx: Terminal[X]): Pull[F, O, Unit] =
+//       try bindBindAux(bb.cont(tx), del)
+//       catch { case NonFatal(e) => Fail(e) }
+//   }
+
+//   @tailrec @nowarn("cat=unchecked")
+//   private def bindBindAux[F[_], O, X](
+//       py: Pull[F, O, X],
+//       del: Bind[F, O, X, Unit]
+//   ): Pull[F, O, Unit] =
+//     py match {
+//       case ty: Terminal[X] =>
+//         del match {
+//           case cici: BindBind[F, O, ?, X] =>
+//             bindBindAux(cici.bb.cont(ty), cici.del)
+//           case _ => del.cont(ty)
+//         }
+//       case x => new DelegateBind(x, del)
+//     }
+
+//   /* An action is an instruction that can perform effects in `F`
+//    * to generate by-product outputs of type `O`.
+//    *
+//    * Each operation also generates an output of type `R` that is used
+//    * as control information for the rest of the interpretation or compilation.
+//    */
+//   private sealed abstract class Action[+F[_], +O, +R] extends Pull[F, O, R] with ViewL[F, O]
+
+//   /* An action that emits a non-empty chunk of outputs. */
+//   private final case class Output[+O](values: Chunk[O]) extends Action[Nothing, O, Unit]
+
+//   /* A translation point, that wraps an inner stream written in another effect. */
+//   private final case class Translate[G[_], F[_], +O](
+//       stream: Pull[G, O, Unit],
+//       fk: G ~> F
+//   ) extends Action[F, O, Unit]
+
+//   private final case class FlatMapOutput[+F[_], O, +P](
+//       stream: Pull[F, O, Unit],
+//       fun: O => Pull[F, P, Unit]
+//   ) extends Action[F, P, Unit]
+
+//   /* Steps through the given inner stream, until the first `Output` is reached.
+//    * It returns the possible `uncons`.
+//    * Yields to head in form of chunk, then id of the scope that was active
+//    * after step evaluated and tail of the `stream`.
+//    *
+//    * @param stream             Stream to step
+//    */
+//   private final case class Uncons[+F[_], +O](stream: Pull[F, O, Unit])
+//       extends Action[Nothing, Nothing, Option[(Chunk[O], Pull[F, O, Unit])]]
+
+//   /** Steps through the stream, providing a `stepLeg`.
+//     * Yields to head in form of chunk, then id of the scope that was active after step evaluated and tail of the `stream`.
+//     *
+//     * @param stream Stream to step
+//     * @param scope  Scope has to be changed before this step is evaluated, id of the scope must be supplied
+//     */
+//   private final case class StepLeg[+F[_], +O](stream: Pull[F, O, Unit], scope: Unique.Token)
+//       extends Action[Nothing, Nothing, Option[Stream.StepLeg[F, O]]]
+
+//   /* The `AlgEffect` trait is for operations on the `F` effect that create no `O` output. */
+//   private sealed abstract class AlgEffect[+F[_], R] extends Action[F, Nothing, R]
+
+//   private final case class Eval[+F[_], R](value: F[R]) extends AlgEffect[F, R]
+
+//   private final case class Acquire[+F[_], R](
+//       resource: F[R],
+//       release: (R, ExitCase) => F[Unit],
+//       cancelable: Boolean
+//   ) extends AlgEffect[F, R]
+
+//   private final case class InScope[+F[_], +O](
+//       stream: Pull[F, O, Unit],
+//       useInterruption: Boolean
+//   ) extends Action[F, O, Unit]
+
+//   private final case class InterruptWhen[+F[_]](haltOnSignal: F[Either[Throwable, Unit]])
+//       extends AlgEffect[F, Unit]
+
+//   // `InterruptedScope` contains id of the scope currently being interrupted
+//   // together with any errors accumulated during interruption process
+//   private abstract class CloseScope extends AlgEffect[Nothing, Unit] {
+//     def scopeId: Unique.Token
+//     def interruption: Option[Interrupted]
+//     def exitCase: ExitCase
+//   }
+
+//   private final case class SucceedScope(scopeId: Unique.Token) extends CloseScope {
+//     def exitCase: ExitCase = ExitCase.Succeeded
+//     def interruption: Option[Interrupted] = None
+//   }
+
+//   private final case class CanceledScope(scopeId: Unique.Token, inter: Interrupted)
+//       extends CloseScope {
+//     def exitCase: ExitCase = ExitCase.Canceled
+//     def interruption: Option[Interrupted] = Some(inter)
+//   }
+
+//   private final case class FailedScope(scopeId: Unique.Token, err: Throwable) extends CloseScope {
+//     def exitCase: ExitCase = ExitCase.Errored(err)
+//     def interruption: Option[Interrupted] = None
+//   }
+
+//   private final case class GetScope[F[_]]() extends AlgEffect[Nothing, Scope[F]]
+
+//   /** Ignores current stepLeg head, goes on with remaining data */
+//   private[fs2] def stepLeg[F[_], O](
+//       leg: Stream.StepLeg[F, O]
+//   ): Pull[F, Nothing, Option[Stream.StepLeg[F, O]]] =
+//     StepLeg[F, O](leg.next, leg.scopeId)
+
+//   /** Wraps supplied pull in new scope, that will be opened before this pull is evaluated
+//     * and closed once this pull either finishes its evaluation or when it fails.
+//     */
+//   private[fs2] def scope[F[_], O](s: Pull[F, O, Unit]): Pull[F, O, Unit] = InScope(s, false)
+
+//   /** Like `scope` but allows this scope to be interrupted.
+//     * Note that this may fail with `Interrupted` when interruption occurred
+//     */
+//   private[fs2] def interruptScope[F[_], O](s: Pull[F, O, Unit]): Pull[F, O, Unit] = InScope(s, true)
+
+//   private[fs2] def interruptWhen[F[_], O](
+//       haltOnSignal: F[Either[Throwable, Unit]]
+//   ): Pull[F, O, Unit] = InterruptWhen(haltOnSignal)
+
+//   private type Cont[-Y, +G[_], +O] = Terminal[Y] => Pull[G, O, Unit]
+
+//   private[this] type Nought[A] = Any
+
+//   /* Left-folds the output of a stream in to a single value of type `B`.
+//    *
+//    * === Interruption ===
+//    *
+//    * Interruption of the stream is implemented cooperatively between `Pull` and `Scope`.
+//    * Unlike interruption of an `F[_]: MonadCancelThrow` type (e.g. `IO`), stream interruption
+//    * needs to find the recovery point where stream evaluation continues.
+//    */
+//   private[fs2] def compile[F[_], O, B](
+//       stream: Pull[F, O, Unit],
+//       initScope: Scope[F],
+//       extendLastTopLevelScope: Boolean,
+//       init: B
+//   )(foldChunk: (B, Chunk[O]) => B)(implicit
+//       F: MonadError[F, Throwable]
+//   ): F[B] = {
+//     var contP: ContP[Nothing, Nought, Any, Unit] = null
+
+//     def getCont(): Cont[Any, Nothing, Nothing] = contP.asInstanceOf[Cont[Any, Nothing, Nothing]]
+
+//     @tailrec
+//     def viewL[G[_], X](free: Pull[G, X, Unit]): ViewL[G, X] =
+//       free match {
+//         case e: Action[G, X, Unit] =>
+//           contP = IdContP
+//           e
+//         case b: Bind[G, X, y, Unit] =>
+//           type Y = y
+//           b.step match {
+//             case c: Bind[G, X, z, Y] =>
+//               viewL(new BindBind[G, X, z, Y](c.step, c.delegate, b.delegate))
+//             case e: Action[G, X, ?] =>
+//               contP = b.delegate
+//               e
+//             case r: Terminal[Y] => viewL(b.cont(r))
+//           }
+//         case r: Terminal[Unit] => r
+//       }
+
+//     /* Inject interruption to the tail used in `flatMap`. Assures that close of the scope
+//      * is invoked if at the flatMap tail, otherwise switches evaluation to `interrupted` path. */
+//     def interruptBoundary[G[_], X](
+//         stream: Pull[G, X, Unit],
+//         interruption: Interrupted
+//     ): Pull[G, X, Unit] =
+//       viewL(stream) match {
+//         case cs: CloseScope =>
+//           // Inner scope is getting closed b/c a parent was interrupted
+//           val cl: Pull[G, X, Unit] = CanceledScope(cs.scopeId, interruption)
+//           transformWith(cl)(getCont())
+//         case _: Action[G, X, y] =>
+//           // all other actions, roll the interruption forwards
+//           getCont()(interruption)
+//         case interrupted: Interrupted => interrupted // impossible
+//         case _: Succeeded[?]          => interruption
+//         case failed: Fail =>
+//           val errs = interruption.deferredError.toList :+ failed.error
+//           Fail(CompositeFailure.fromList(errs).getOrElse(failed.error))
+//       }
+
+//     trait Run[-G[_], -X, +End] {
+//       def done(scope: Scope[F]): End
+//       def out(head: Chunk[X], scope: Scope[F], tail: Pull[G, X, Unit]): End
+//       def interrupted(inter: Interrupted): End
+//       def fail(e: Throwable): End
+//     }
+//     type CallRun[+G[_], +X, End] = Run[G, X, End] => End
+
+//     object TheBuildR extends Run[Nothing, Nothing, F[CallRun[Nothing, Nothing, F[Nothing]]]] {
+//       def fail(e: Throwable) = F.raiseError(e)
+//       def done(scope: Scope[F]) = F.pure(_.done(scope))
+//       def out(head: Chunk[Nothing], scope: Scope[F], tail: Pull[Nothing, Nothing, Unit]) =
+//         F.pure(_.out(head, scope, tail))
+//       def interrupted(i: Interrupted) = F.pure(_.interrupted(i))
+//     }
+
+//     def buildR[G[_], X, End]: Run[G, X, F[CallRun[G, X, F[End]]]] =
+//       TheBuildR.asInstanceOf[Run[G, X, F[CallRun[G, X, F[End]]]]]
+
+//     def go[G[_], X, End](
+//         scope: Scope[F],
+//         extendedTopLevelScope: Option[Scope[F]],
+//         translation: G ~> F,
+//         runner: Run[G, X, F[End]],
+//         stream: Pull[G, X, Unit]
+//     ): F[End] = {
+
+//       def interruptGuard(scope: Scope[F], view: Cont[Nothing, G, X])(next: => F[End]): F[End] =
+//         scope.isInterrupted.flatMap {
+//           case None => next
+//           case Some(outcome) =>
+//             val result = outcome match {
+//               case Outcome.Errored(err)       => Fail(err)
+//               case Outcome.Canceled()         => Interrupted(scope.id, None)
+//               case Outcome.Succeeded(scopeId) => Interrupted(scopeId, None)
+//             }
+//             go(scope, extendedTopLevelScope, translation, runner, view(result))
+//         }
+
+//       def goErr(err: Throwable, view: Cont[Nothing, G, X]): F[End] =
+//         go(scope, extendedTopLevelScope, translation, runner, view(Fail(err)))
+
+//       class ViewRunner(val view: Cont[Unit, G, X]) extends Run[G, X, F[End]] {
+//         private val prevRunner = runner
+
+//         def done(doneScope: Scope[F]): F[End] =
+//           go(doneScope, extendedTopLevelScope, translation, prevRunner, view(unit))
+
+//         def out(head: Chunk[X], scope: Scope[F], tail: Pull[G, X, Unit]): F[End] = {
+//           @tailrec
+//           def outLoop(acc: Pull[G, X, Unit], pred: Run[G, X, F[End]]): F[End] =
+//             // bit of an ugly hack to avoid a stack overflow when these accummulate
+//             pred match {
+//               case vrun: ViewRunner @unchecked => outLoop(bindView(acc, vrun.view), vrun.prevRunner)
+//               case _                           => pred.out(head, scope, acc)
+//             }
+//           outLoop(tail, this)
+//         }
+
+//         def interrupted(inter: Interrupted): F[End] =
+//           go(scope, extendedTopLevelScope, translation, prevRunner, view(inter))
+
+//         def fail(e: Throwable): F[End] = goErr(e, view)
+//       }
+
+//       class TranslateRunner[H[_]](fk: H ~> G, view: Cont[Unit, G, X]) extends Run[H, X, F[End]] {
+//         def done(doneScope: Scope[F]): F[End] =
+//           go(doneScope, extendedTopLevelScope, translation, runner, view(unit))
+//         def out(head: Chunk[X], scope: Scope[F], tail: Pull[H, X, Unit]): F[End] = {
+//           val next = bindView(Translate(tail, fk), view)
+//           runner.out(head, scope, next)
+//         }
+//         def interrupted(inter: Interrupted): F[End] =
+//           go(scope, extendedTopLevelScope, translation, runner, view(inter))
+//         def fail(e: Throwable): F[End] = goErr(e, view)
+//       }
+
+//       abstract class StepRunR[Y, S](view: Cont[Option[S], G, X]) extends Run[G, Y, F[End]] {
+//         def done(scope: Scope[F]): F[End] =
+//           interruptGuard(scope, view) {
+//             go(scope, extendedTopLevelScope, translation, runner, view(Succeeded(None)))
+//           }
+
+//         def interrupted(inter: Interrupted): F[End] =
+//           go(scope, extendedTopLevelScope, translation, runner, view(inter))
+
+//         def fail(e: Throwable): F[End] = goErr(e, view)
+//       }
+
+//       class UnconsRunR[Y](view: Cont[Option[(Chunk[Y], Pull[G, Y, Unit])], G, X])
+//           extends StepRunR[Y, (Chunk[Y], Pull[G, Y, Unit])](view) {
+
+//         def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] =
+//           // For a Uncons, we continue in same Scope at which we ended compilation of inner stream
+//           interruptGuard(outScope, view) {
+//             val result = Succeeded(Some((head, tail)))
+//             go(outScope, extendedTopLevelScope, translation, runner, view(result))
+//           }
+//       }
+
+//       class StepLegRunR[Y](view: Cont[Option[Stream.StepLeg[G, Y]], G, X])
+//           extends StepRunR[Y, Stream.StepLeg[G, Y]](view) {
+
+//         def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] =
+//           // StepLeg: we shift back to the scope at which we were
+//           // before we started to interpret the Leg's inner stream.
+//           interruptGuard(scope, view) {
+//             val result = Succeeded(Some(new Stream.StepLeg(head, outScope.id, tail)))
+//             go(scope, extendedTopLevelScope, translation, runner, view(result))
+//           }
+//       }
+
+//       class FlatMapR[Y](view: Cont[Unit, G, X], fun: Y => Pull[G, X, Unit])
+//           extends Run[G, Y, F[End]] {
+//         private[this] def unconsed(chunk: Chunk[Y], tail: Pull[G, Y, Unit]): Pull[G, X, Unit] =
+//           if (chunk.size == 1 && tail.isInstanceOf[Succeeded[?]])
+//             // nb: If tl is Pure, there's no need to propagate flatMap through the tail. Hence, we
+//             // check if hd has only a single element, and if so, process it directly instead of folding.
+//             // This allows recursive infinite streams of the form `def s: Stream[Pure,O] = Stream(o).flatMap { _ => s }`
+//             try fun(chunk(0))
+//             catch { case NonFatal(e) => Fail(e) }
+//           else {
+//             def go(idx: Int): Pull[G, X, Unit] =
+//               if (idx == chunk.size)
+//                 tail.flatMapOutput(fun)
+//               else {
+//                 try {
+//                   var j = idx
+//                   @tailrec
+//                   def loop: Pull[G, X, Unit] = fun(chunk(j)) match {
+//                     case Succeeded(_) if j < chunk.size - 1 =>
+//                       j += 1
+//                       loop
+//                     case p => p
+//                   }
+
+//                   val next: Pull[G, X, Unit] = loop
+//                   transformWith(next) {
+//                     case Succeeded(_) => go(j + 1)
+//                     case Fail(err)    => Fail(err)
+//                     case interruption @ Interrupted(_, _) =>
+//                       interruptBoundary(tail, interruption).flatMapOutput(fun)
+//                   }
+//                 } catch { case NonFatal(e) => Fail(e) }
+//               }
+
+//             go(0)
+//           }
+
+//         def done(scope: Scope[F]): F[End] =
+//           interruptGuard(scope, view) {
+//             go(scope, extendedTopLevelScope, translation, runner, view(unit))
+//           }
+
+//         def out(head: Chunk[Y], outScope: Scope[F], tail: Pull[G, Y, Unit]): F[End] = {
+//           val next = bindView(unconsed(head, tail), view)
+//           go(outScope, extendedTopLevelScope, translation, runner, next)
+//         }
+
+//         def interrupted(inter: Interrupted): F[End] =
+//           go(scope, extendedTopLevelScope, translation, runner, view(inter))
+
+//         def fail(e: Throwable): F[End] = goErr(e, view)
+//       }
+
+//       def goEval[V](eval: Eval[G, V], view: Cont[V, G, X]): F[End] =
+//         scope.interruptibleEval(translation(eval.value)).flatMap { eitherOutcome =>
+//           val result = eitherOutcome match {
+//             case Right(r)                       => Succeeded(r)
+//             case Left(Outcome.Errored(err))     => Fail(err)
+//             case Left(Outcome.Canceled())       => Interrupted(scope.id, None)
+//             case Left(Outcome.Succeeded(token)) => Interrupted(token, None)
+//           }
+//           go(scope, extendedTopLevelScope, translation, runner, view(result))
+//         }
+
+//       def goAcquire[R](acquire: Acquire[G, R], view: Cont[R, G, X]): F[End] = {
+//         val onScope = scope.acquireResource[R](
+//           poll =>
+//             if (acquire.cancelable) poll(translation(acquire.resource))
+//             else translation(acquire.resource),
+//           (resource, exit) => translation(acquire.release(resource, exit))
+//         )
+//         val cont = onScope.flatMap { outcome =>
+//           val result = outcome match {
+//             case Outcome.Succeeded(Right(r))      => Succeeded(r)
+//             case Outcome.Succeeded(Left(scopeId)) => Interrupted(scopeId, None)
+//             case Outcome.Canceled()               => Interrupted(scope.id, None)
+//             case Outcome.Errored(err)             => Fail(err)
+//           }
+//           go(scope, extendedTopLevelScope, translation, runner, view(result))
+//         }
+//         interruptGuard(scope, view)(cont)
+//       }
+
+//       def goInterruptWhen(
+//           haltOnSignal: F[Either[Throwable, Unit]],
+//           view: Cont[Unit, G, X]
+//       ): F[End] = {
+//         val onScope = scope.acquireResource(
+//           _ => scope.interruptWhen(haltOnSignal),
+//           (f: Fiber[F, Throwable, Unit], _: ExitCase) => f.cancel
+//         )
+//         val cont = onScope.flatMap { outcome =>
+//           val result = outcome match {
+//             case Outcome.Succeeded(Right(_))      => unit
+//             case Outcome.Succeeded(Left(scopeId)) => Interrupted(scopeId, None)
+//             case Outcome.Canceled()               => Interrupted(scope.id, None)
+//             case Outcome.Errored(err)             => Fail(err)
+//           }
+//           go(scope, extendedTopLevelScope, translation, runner, view(result))
+//         }
+//         interruptGuard(scope, view)(cont)
+//       }
+
+//       def goInScope(
+//           stream: Pull[G, X, Unit],
+//           useInterruption: Boolean,
+//           view: Cont[Unit, G, X]
+//       ): F[End] = {
+//         def endScope(scopeId: Unique.Token, result: Terminal[Unit]): Pull[G, X, Unit] =
+//           result match {
+//             case Succeeded(_)              => SucceedScope(scopeId)
+//             case inter @ Interrupted(_, _) => CanceledScope(scopeId, inter)
+//             case Fail(err)                 => FailedScope(scopeId, err)
+//           }
+
+//         val maybeCloseExtendedScope: F[Option[Scope[F]]] =
+//           // If we're opening a new top-level scope (aka, direct descendant of root),
+//           // close the current extended top-level scope if it is defined.
+//           if (scope.isRoot && extendedTopLevelScope.isDefined)
+//             extendedTopLevelScope.traverse_(_.close(ExitCase.Succeeded).rethrow).as(None)
+//           else
+//             F.pure(extendedTopLevelScope)
+
+//         val tail = maybeCloseExtendedScope.flatMap { newExtendedScope =>
+//           scope.open(useInterruption).rethrow.flatMap { childScope =>
+//             val bb = new Bind[G, X, Unit, Unit](stream) {
+//               def cont(r: Terminal[Unit]): Pull[G, X, Unit] = endScope(childScope.id, r)
+//             }
+//             go(childScope, newExtendedScope, translation, new ViewRunner(view), bb)
+//           }
+//         }
+//         interruptGuard(scope, view)(tail)
+//       }
+
+//       def goCloseScope(close: CloseScope, view: Cont[Unit, G, X]): F[End] = {
+//         def addError(err: Throwable, res: Terminal[Unit]): Terminal[Unit] = res match {
+//           case Succeeded(_) => Fail(err)
+//           case Fail(err0)   => Fail(CompositeFailure(err, err0, Nil))
+//           // Note: close.interruption.isSome IF-AND-ONLY-IF close.exitCase is ExitCase.Cancelled
+//           case Interrupted(_, _) => sys.error(s"Impossible, cannot interrupt here")
+//         }
+
+//         def viewCont(res: Terminal[Unit]): Pull[G, X, Unit] =
+//           close.exitCase match {
+//             case ExitCase.Errored(err) => view(addError(err, res))
+//             case _                     => view(res)
+//           }
+
+//         def closeTerminal(r: Either[Throwable, Unit], ancestor: Scope[F]): Terminal[Unit] =
+//           close.interruption match {
+//             case None => r.fold(Fail(_), Succeeded(_))
+//             case Some(Interrupted(interruptedScopeId, err)) =>
+//               def err1 = CompositeFailure.fromList(r.swap.toOption.toList ++ err.toList)
+//               if (ancestor.descendsFrom(interruptedScopeId))
+//                 // we still have scopes to interrupt, lets build interrupted tail
+//                 Interrupted(interruptedScopeId, err1)
+//               else
+//                 // interrupts scope was already interrupted, resume operation
+//                 err1 match {
+//                   case None     => unit
+//                   case Some(e2) => Fail(e2)
+//                 }
+//           }
+
+//         scope.findInLineage(close.scopeId).flatMap {
+//           case Some(toClose) if toClose.isRoot =>
+//             // Impossible - don't close root scope as a result of a `CloseScope` call
+//             go(scope, extendedTopLevelScope, translation, runner, viewCont(unit))
+
+//           case Some(toClose) if extendLastTopLevelScope && toClose.level == 1 =>
+//             // Request to close the current top-level scope - if we're supposed to extend
+//             // it instead, leave the scope open and pass it to the continuation
+//             extendedTopLevelScope.traverse_(_.close(ExitCase.Succeeded).rethrow) *>
+//               toClose.openAncestor.flatMap { ancestor =>
+//                 go(ancestor, Some(toClose), translation, runner, viewCont(unit))
+//               }
+
+//           case Some(toClose) =>
+//             toClose.close(close.exitCase).flatMap { r =>
+//               toClose.openAncestor.flatMap { ancestor =>
+//                 val res = closeTerminal(r, ancestor)
+//                 go(ancestor, extendedTopLevelScope, translation, runner, viewCont(res))
+//               }
+//             }
+
+//           case None =>
+//             // scope already closed, continue with current scope
+//             val result = close.interruption.getOrElse(unit)
+//             go(scope, extendedTopLevelScope, translation, runner, viewCont(result))
+//         }
+//       }
+
+//       (viewL(stream): @unchecked) match { // unchecked b/c scala 3 erroneously reports exhaustiveness warning
+//         case tst: Translate[h, G, ?] @unchecked => // y = Unit
+//           val translateRunner: Run[h, X, F[End]] = new TranslateRunner(tst.fk, getCont())
+//           val composed: h ~> F = translation.compose(tst.fk)
+//           go(scope, extendedTopLevelScope, composed, translateRunner, tst.stream)
+
+//         case output: Output[?] =>
+//           val view = getCont()
+//           interruptGuard(scope, view)(
+//             runner.out(output.values, scope, view(unit))
+//           )
+
+//         case fmout: FlatMapOutput[G, z, ?] => // y = Unit
+//           val fmrunr = new FlatMapR(getCont(), fmout.fun)
+//           F.unit >> go(scope, extendedTopLevelScope, translation, fmrunr, fmout.stream)
+
+//         case u: Uncons[G, y] @unchecked =>
+//           val v = getCont()
+//           // a Uncons is run on the same scope, without shifting.
+//           val runr = buildR[G, y, End]
+//           F.unit >> go(scope, extendedTopLevelScope, translation, runr, u.stream).attempt
+//             .flatMap(_.fold(goErr(_, v), _.apply(new UnconsRunR(v))))
+
+//         case s: StepLeg[G, y] @unchecked =>
+//           val v = getCont()
+//           val runr = buildR[G, y, End]
+//           scope
+//             .shiftScope(s.scope, s.toString)
+//             .flatMap(go(_, extendedTopLevelScope, translation, runr, s.stream).attempt)
+//             .flatMap(_.fold(goErr(_, v), _.apply(new StepLegRunR(v))))
+
+//         case _: GetScope[?] =>
+//           go(scope, extendedTopLevelScope, translation, runner, getCont()(Succeeded(scope)))
+//         case eval: Eval[G, r]       => goEval[r](eval, getCont())
+//         case acquire: Acquire[G, ?] => goAcquire(acquire, getCont())
+//         case inScope: InScope[G, ?] =>
+//           goInScope(inScope.stream, inScope.useInterruption, getCont())
+//         case int: InterruptWhen[G] =>
+//           goInterruptWhen(translation(int.haltOnSignal), getCont())
+//         case close: CloseScope => goCloseScope(close, getCont())
+
+//         case _: Succeeded[?]  => runner.done(scope)
+//         case failed: Fail     => runner.fail(failed.error)
+//         case int: Interrupted => runner.interrupted(int)
+//       }
+//     }
+
+//     val initFk: F ~> F = cats.arrow.FunctionK.id[F]
+
+//     class OuterRun(initB: B) extends Run[F, O, F[B]] { self =>
+//       private[this] var accB: B = initB
+
+//       override def done(scope: Scope[F]): F[B] = F.pure(accB)
+
+//       override def fail(e: Throwable): F[B] = F.raiseError(e)
+
+//       override def interrupted(inter: Interrupted): F[B] =
+//         inter.deferredError.fold(F.pure(accB))(F.raiseError)
+
+//       override def out(head: Chunk[O], scope: Scope[F], tail: Pull[F, O, Unit]): F[B] =
+//         try {
+//           accB = foldChunk(accB, head)
+//           go(scope, None, initFk, self, tail)
+//         } catch {
+//           case NonFatal(e) =>
+//             viewL(tail) match {
+//               case _: Action[F, O, ?] =>
+//                 go(scope, None, initFk, self, getCont()(Fail(e)))
+//               case Succeeded(_)        => F.raiseError(e)
+//               case Fail(e2)            => F.raiseError(CompositeFailure(e2, e))
+//               case Interrupted(_, err) => F.raiseError(err.fold(e)(t => CompositeFailure(e, t)))
+//             }
+//         }
+//     }
+
+//     go(initScope, None, initFk, new OuterRun(init), stream)
+//   }
+
+//   @deprecated("use the extension method", "3.4.0")
+//   private[fs2] def flatMapOutput[F[_], F2[x] >: F[x], O, O2](
+//       p: Pull[F, O, Unit],
+//       f: O => Pull[F2, O2, Unit]
+//   ): Pull[F2, O2, Unit] =
+//     p.flatMapOutput(f)
+
+//   private[fs2] def translate[F[_], G[_], O](
+//       stream: Pull[F, O, Unit],
+//       fK: F ~> G
+//   ): Pull[G, O, Unit] =
+//     stream match {
+//       case t: Translate[?, f, ?] =>
+//         translate(t.stream, t.fk.andThen(fK.asInstanceOf[f ~> G]))
+//       case o: Output[?]   => o
+//       case r: Terminal[?] => r
+//       case _              => Translate(stream, fK)
+//     }
+
+//   /* Applies the outputs of this pull to `f` and returns the result in a new `Pull`. */
+//   private[fs2] def mapOutput[F[_], O, P](s: Stream[F, O], f: O => P): Pull[F, P, Unit] =
+//     interruptScope(mapOutputNoScope(s, f))
+
+//   /** Like `mapOutput` but does not insert an interruption scope. */
+//   private[fs2] def mapOutputNoScope[F[_], O, P](
+//       s: Stream[F, O],
+//       f: O => P
+//   ): Pull[F, P, Unit] =
+//     s.pull.echo.unconsFlatMap(hd => Pull.output(hd.map(f)))
+
+//   private[this] def transformWith[F[_], O, R, S](p: Pull[F, O, R])(
+//       f: Terminal[R] => Pull[F, O, S]
+//   ): Pull[F, O, S] =
+//     p match {
+//       case r: Terminal[R] =>
+//         try f(r)
+//         catch { case NonFatal(e) => Fail(e) }
+//       case _ =>
+//         new Bind[F, O, R, S](p) {
+//           def cont(r: Terminal[R]): Pull[F, O, S] =
+//             try f(r)
+//             catch { case NonFatal(e) => Fail(e) }
+//         }
+//     }
+
+//   /** Provides syntax for pure pulls based on `cats.Id`. */
+//   implicit final class IdOps[O](private val self: Pull[Id, O, Unit]) extends AnyVal {
+//     private def idToApplicative[F[_]: Applicative]: Id ~> F =
+//       new (Id ~> F) { def apply[A](a: Id[A]) = a.pure[F] }
+
+//     def covaryId[F[_]: Applicative]: Pull[F, O, Unit] = Pull.translate(self, idToApplicative[F])
+//   }
+// }
 
 private[fs2] trait PullLowPriority {
   implicit def monadErrorInstance[F[_], O]: MonadError[Pull[F, O, *], Throwable] =
@@ -1389,6 +1390,8 @@ private[fs2] class PullSyncInstance[F[_], O](implicit F: Sync[F])
     flatMap(attempt(fa))(_ => fb)
 }
 
+// object Capsule {
+
 trait Leasable[F[_]] { self =>
   def lease: Resource[F, Boolean]
 
@@ -1418,7 +1421,10 @@ object Arc {
 
     def releaseLease(id: Int): (Option[State[F]], List[F[Unit]]) = {
       val without = activeLeases - id
-      if (without.isEmpty) None -> finalizers.values.toList
+      if (without.isEmpty)
+        None -> finalizers.toList
+          .sortBy { case (i, _) => -i }
+          .map { case (_, fin) => fin }
       else Some(copy(activeLeases = without)) -> Nil
     }
 
@@ -1499,232 +1505,412 @@ final case class Context[F[_]](
     parents: List[Leasable[F]]
 )
 
-final case class Unconsed[F[_], G[_], O, A](
-    context: Context[G],
-    cont: Either[A, (Chunk[O], Context[G] => G[Unconsed[F, G, O, A]])]
-) {
-  // def evalMapPull[F2[_]](
-  //     f: Pull2[F, O, A] => G[Pull2[F2, O, A]]
-  // )(implicit G: Compiler.Target[G]): Unconsed[F2, G, O, A] =
-  //   Unconsed(context, cont.map { case (hd, tl) => hd -> tl.flatMap(f) })
-}
+sealed abstract class Pull[+F[_], +O, +R] {
 
-sealed abstract class Pull2[+F[_], +O, +R] {
-  def flatMap[F2[x] >: F[x], O2 >: O, R2](f: R => Pull2[F2, O2, R2]): Pull2[F2, O2, R2] =
-    Pull2.flatMap(this: Pull2[F2, O2, R])(f)
+  def flatMap[F2[x] >: F[x], O2 >: O, R2](f: R => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
+    Pull.flatMap(this: Pull[F2, O2, R])(f)
 
-  def >>[F2[x] >: F[x], O2 >: O, R2](p: => Pull2[F2, O2, R2]): Pull2[F2, O2, R2] =
+  def >>[F2[x] >: F[x], O2 >: O, R2](p: => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
     flatMap(_ => p)
 
-  def evalMap[F2[x] >: F[x], R2](f: R => F2[R2]): Pull2[F2, O, R2] =
-    Pull2.evalMap(this: Pull2[F2, O, R])(f)
+  def evalMap[F2[x] >: F[x], R2](f: R => F2[R2]): Pull[F2, O, R2] =
+    Pull.evalMap(this: Pull[F2, O, R])(f)
 
-  def handleErrorWith[F2[x] >: F[x], O2 >: O, R2 >: R](handler: Throwable => Pull2[F2, O2, R2]) =
-    Pull2.handleErrorWith(this: Pull2[F2, O2, R2])(handler)
+  def handleErrorWith[F2[x] >: F[x], O2 >: O, R2 >: R](handler: Throwable => Pull[F2, O2, R2]) =
+    Pull.handleErrorWith(this: Pull[F2, O2, R2])(handler)
 
-  def onComplete[F2[x] >: F[x], O2 >: O, R2](p: => Pull2[F2, O2, R2]): Pull2[F2, O2, R2] =
-    Pull2.handleErrorWith(this: Pull2[F2, O2, R])(e => p >> Pull2.raiseError(e)) >> p
+  def onComplete[F2[x] >: F[x], O2 >: O, R2](p: => Pull[F2, O2, R2]): Pull[F2, O2, R2] =
+    Pull.handleErrorWith(this: Pull[F2, O2, R])(e => p >> Pull.raiseError(e)) >> p
 
-  def covaryAll[F2[x] >: F[x], O2 >: O, R2 >: R]: Pull2[F2, O2, R2] = this
+  def covaryAll[F2[x] >: F[x], O2 >: O, R2 >: R]: Pull[F2, O2, R2] = this
 
-  def covary[F2[x] >: F[x]]: Pull2[F2, O, R] = this
+  def covary[F2[x] >: F[x]]: Pull[F2, O, R] = this
 
-  def covaryOutput[O2 >: O]: Pull2[F, O2, R] = this
+  def covaryOutput[O2 >: O]: Pull[F, O2, R] = this
 
-  def covaryResult[R2 >: R]: Pull2[F, O, R2] = this
+  def covaryResult[R2 >: R]: Pull[F, O, R2] = this
 
-  def attempt: Pull2[F, O, Either[Throwable, R]] =
-    map(_.asRight[Throwable]).handleErrorWith(e => Pull2.pure(Left(e)))
+  def attempt: Pull[F, O, Either[Throwable, R]] =
+    map(_.asRight[Throwable]).handleErrorWith(e => Pull.pure(Left(e)))
 
-  def map[B](f: R => B): Pull2[F, O, B] = flatMap(r => Pull2.pure(f(r)))
+  def map[B](f: R => B): Pull[F, O, B] = flatMap(r => Pull.pure(f(r)))
 
-  def void: Pull2[F, O, Unit] = as(())
+  def void: Pull[F, O, Unit] = as(())
 
-  def as[B](b: B): Pull2[F, O, B] = map(_ => b)
+  def as[B](b: B): Pull[F, O, B] = map(_ => b)
 
-  def lease: Pull2[F, O, R] = ???
+  def lease: Pull[F, O, R] = ???
 }
-object Pull2 {
-  final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull2[F, O, Unit]) {}
 
-  implicit final class StreamPullOps[F[_], O](private val self: Pull2[F, O, Unit]) extends AnyVal {
-    def stream: Stream[F, O] = new Stream(Pull2.scope(self))
+object Pull extends PullLowPriority {
+  type Ctx[F[_], A] = StateT[F, Context[F], A]
+  def Ctx[F[_]: MonadThrow] = MonadThrow[Ctx[F, *]]
+  type Cont[F[_], G[_], O, A] = Either[A, (Chunk[O], Pull[F, O, A])]
+  type Unconsed[F[_], G[_], O, A] = Ctx[G, Cont[F, G, O, A]]
+
+  implicit final class StreamPullOps[F[_], O](private val self: Pull[F, O, Unit]) extends AnyVal {
+    def stream: Stream[F, O] = new Stream(Pull.scope(self))
 
     def streamNoScope: Stream[F, O] = new Stream(self)
 
-    // def flatMapOutput[F2[x] >: F[x], O2](
-    //   f: O => Pull2[F2, O2, Unit]
-    // ): Pull2[F2, O2, Unit] =
+    def flatMapOutput[F2[x] >: F[x], O2](f: O => Pull[F2, O2, Unit]): Pull[F2, O2, Unit] =
+      Pull.flatMapOutput(self: Pull[F2, O, Unit], f)
+
+    def unconsFlatMap[O2](
+        f: Chunk[O] => Pull[F, O2, Unit]
+    ): Pull[F, O2, Unit] =
+      uncons.flatMap {
+        case None           => Pull.done
+        case Some((hd, tl)) => f(hd) >> tl.unconsFlatMap(f)
+      }
+
+    def uncons: Pull[F, Nothing, Option[(Chunk[O], Pull[F, O, Unit])]] =
+      Pull.uncons(self).map(_.toOption)
   }
 
-  trait PullImpl[F[_], O, A] extends Pull2[F, O, A] {
+  trait PullImpl[F[_], O, A] extends Pull[F, O, A] {
     def run[G[_]](
         generalize: F ~> G,
-        unsafeSpecialize: G ~> F,
-        ctx: Context[G]
-    )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, A]]
+        unsafeSpecialize: G ~> F
+    )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, A]
   }
 
   def step[F[_], G[_], O, A](
-      p: Pull2[F, O, A],
+      p: Pull[F, O, A],
       generalize: F ~> G,
-      unsafeSpecialize: G ~> F,
-      ctx: Context[G]
-  )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, A]] = p match {
-    case pi: PullImpl[F, O, A] => pi.run(generalize, unsafeSpecialize, ctx)
+      unsafeSpecialize: G ~> F
+  )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, A] = p match {
+    case pi: PullImpl[F, O, A] => pi.run(generalize, unsafeSpecialize)
   }
 
-  // def fold[F[_], O, A, B](
-  //     p: Pull2[F, O, A],
-  //     init: B,
-  //     root: Arc[F]
-  // )(fold: (B, Chunk[O]) => B)(implicit F: Compiler.Target[F]) =
-  //   (init, Unconsed(Context(root, Nil), Right(fs2.Chunk.empty -> F.pure(p))))
-  //     .tailRecM[F, (B, A)] {
-  //       case (z, Unconsed(_, Left(a))) => F.pure(Right((z, a)))
-  //       case (z, Unconsed(ctx, Right((hd, tl)))) =>
-  //         val z2 = if (hd.nonEmpty) fold(z, hd) else z
-  //         tl.flatMap(step(_, FunctionK.id[F], FunctionK.id[F], ctx).map(x => Left(z2 -> x)))
-  //     }
+  def fold[F[_], O, A, B](
+      p: Pull[F, O, A],
+      init: B,
+      root: Arc[F]
+  )(fold: (B, Chunk[O]) => B)(implicit F: Compiler.Target[F]): F[(B, A)] =
+    (init, p)
+      .tailRecM { case (z, p) =>
+        step(p, FunctionK.id[F], FunctionK.id[F])
+          .map[Either[(B, Pull[F, O, A]), (B, A)]] {
+            case Left(a) => Right((z, a))
+            case Right((hd, tl)) =>
+              val z2 = if (hd.nonEmpty) fold(z, hd) else z
+              Left(z2 -> tl)
+          }
+      }
+      .runA(Context(root, Nil))
+
+  def compile[F[_], O, B](
+      stream: Pull[F, O, Unit],
+      initScope: Arc[F],
+      extendLastTopLevelScope: Boolean,
+      init: B
+  )(foldChunk: (B, Chunk[O]) => B)(implicit
+      F: Compiler.Target[F]
+  ) = fold(stream, init, initScope)(foldChunk)
 
   def flatMap[F[_], O, A, B](
-      fa: Pull2[F, O, A]
-  )(f: A => Pull2[F, O, B]): Pull2[F, O, B] =
+      fa: Pull[F, O, A]
+  )(f: A => Pull[F, O, B]): Pull[F, O, B] =
     new PullImpl[F, O, B] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, B]] = {
-        def go(uc: Unconsed[F, G, O, A]): G[Unconsed[F, G, O, B]] =
-          uc.cont match {
-            case Left(a) =>
-              step(f(a), generalize, unsafeSpecialize, uc.context)
-            case Right((hd, tl)) =>
-              G.pure(Unconsed(uc.context, Right(hd -> tl.andThen(_.flatMap(go)))))
-          }
-
-        step(fa, generalize, unsafeSpecialize, ctx).flatMap(go)
-      }
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, B] =
+        step(fa, generalize, unsafeSpecialize).flatMap {
+          case Left(a)         => step(f(a), generalize, unsafeSpecialize)
+          case Right((hd, tl)) => StateT.pure(Right(hd -> Pull.flatMap(tl)(f)))
+        }
     }
 
-  def pure[F[_], A](a: A): Pull2[F, Nothing, A] =
+  def pure[F[_], A](a: A): Pull[F, Nothing, A] =
     new PullImpl[F, Nothing, A] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, Nothing, A]] =
-        G.pure(Unconsed(ctx, Left(a)))
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, Nothing, A] =
+        StateT.pure(Left(a))
     }
 
-  val done: Pull2[Nothing, Nothing, Unit] = pure(())
+  val done: Pull[Nothing, Nothing, Unit] = pure(())
 
-  def output[F[_], O](chunk: Chunk[O]): Pull2[F, O, Unit] =
+  def sleep[F[_]](d: FiniteDuration)(implicit t: Temporal[F]): Pull[F, Nothing, Unit] =
+    Pull.eval(t.sleep(d))
+
+  def output[F[_], O](chunk: Chunk[O]): Pull[F, O, Unit] =
     new PullImpl[F, O, Unit] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, Unit]] =
-        G.pure(Unconsed(ctx, Right(chunk -> (c => G.pure(Unconsed(c, Left(())))))))
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, Unit] =
+        StateT.pure(Right(chunk -> Pull.done))
     }
 
-  def evalMap[F[_], O, R, R2](
-      p: Pull2[F, O, R]
-  )(f: R => F[R2]): Pull2[F, O, R2] =
-    p.flatMap(r => Pull2.eval(f(r)))
+  def output1[F[_], O](o: O): Pull[F, O, Unit] = output(Chunk.singleton(o))
 
-  def eval[F[_], R](f: F[R]): Pull2[F, Nothing, R] =
+  def outputOption1[F[_], O](o: Option[O]): Pull[F, O, Unit] =
+    o.map(output1).getOrElse(Pull.done)
+
+  def attemptEval[F[_], R](fa: F[R]): Pull[F, Nothing, Either[Throwable, R]] =
+    Pull.handleErrorWith(Pull.eval(fa).map(_.asRight[Throwable]))(e => Pull.pure(e.asLeft))
+
+  def bracketCase[F[_], O, A, B](
+      acquire: Pull[F, O, A],
+      use: A => Pull[F, O, B],
+      release: (A, ExitCase) => Pull[F, O, Unit]
+  ): Pull[F, O, B] = ???
+
+  def extendScopeTo[F[_], O](
+      s: Stream[F, O]
+  )(implicit F: MonadError[F, Throwable]): Pull[F, Nothing, Stream[F, O]] = ???
+
+  def loop[F[_], O, R](f: R => Pull[F, O, Option[R]]): R => Pull[F, O, Unit] =
+    (r: R) =>
+      f(r).flatMap {
+        case None    => Pull.done
+        case Some(s) => loop(f)(s)
+      }
+
+  def loopEither[F[_], O, S, R](f: S => Pull[F, O, Either[S, R]]): S => Pull[F, O, R] =
+    (s: S) =>
+      f(s).flatMap {
+        case Left(ns) => loopEither(f)(ns)
+        case Right(r) => Pull.pure(r)
+      }
+
+  final class PartiallyAppliedFromEither[F[_]] {
+    def apply[A](either: Either[Throwable, A])(implicit
+        ev: RaiseThrowable[F]
+    ): Pull[F, A, Unit] =
+      either.fold(raiseError[F], output1)
+  }
+
+  def fromEither[F[_]] = new PartiallyAppliedFromEither[F]
+
+  def suspend[F[_], O, R](p: => Pull[F, O, R]): Pull[F, O, R] =
+    done >> p
+
+  trait Timed[F[_], O] {
+    type Timeout
+    def uncons: Pull[F, Nothing, Option[(Either[Timeout, Chunk[O]], Pull.Timed[F, O])]]
+    def timeout(t: FiniteDuration): Pull[F, Nothing, Unit]
+  }
+
+  implicit def syncInstance[F[_]: Sync, O]: Sync[Pull[F, O, *]] =
+    ???
+  // new PullSyncInstance[F, O]
+
+  implicit def functionKInstance[F[_]]: F ~> Pull[F, Nothing, *] = ???
+  // new (F ~> Pull[F, Nothing, *]) {
+  //   def apply[X](fx: F[X]) = Pull.eval(fx)
+  // }
+
+  /** Provides syntax for pure pulls based on `cats.Id`. */
+  implicit final class IdOps[O](private val self: Pull[Id, O, Unit]) extends AnyVal {
+    private def idToApplicative[F[_]: Applicative]: Id ~> F =
+      new (Id ~> F) { def apply[A](a: Id[A]) = a.pure[F] }
+
+    def covaryId[F[_]: Applicative]: Pull[F, O, Unit] = Pull.translate(self, idToApplicative[F])
+  }
+
+  def evalMap[F[_], O, R, R2](
+      p: Pull[F, O, R]
+  )(f: R => F[R2]): Pull[F, O, R2] =
+    p.flatMap(r => Pull.eval(f(r)))
+
+  def eval[F[_], R](fa: F[R]): Pull[F, Nothing, R] =
     new PullImpl[F, Nothing, R] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, Nothing, R]] =
-        generalize(f).map(r => Unconsed(ctx, Left(r)))
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, Nothing, R] =
+        StateT.liftF(generalize(fa)).map(_.asLeft)
     }
 
-  def handleErrorWith[F[_], O, R](p: Pull2[F, O, R])(
-      handler: Throwable => Pull2[F, O, R]
-  ): Pull2[F, O, R] =
+  def handleErrorWith[F[_], O, R](p: Pull[F, O, R])(
+      handler: Throwable => Pull[F, O, R]
+  ): Pull[F, O, R] =
     new PullImpl[F, O, R] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, R]] = {
-        def go(uc: Unconsed[F, G, O, R]): Unconsed[F, G, O, R] =
-          uc.cont match {
-            case Left(r) => Unconsed(uc.context, Left(r))
-            case Right((hd, tl)) =>
-              val tl2 = tl.andThen(_.attempt.flatMap {
-                case Left(e)   => step(handler(e), generalize, unsafeSpecialize, uc.context)
-                case Right(uc) => G.pure(go(uc))
-              })
-              Unconsed(uc.context, Right(hd -> tl2))
-          }
-
-        step(p, generalize, unsafeSpecialize, ctx).map(go)
-      }
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, R] =
+        Ctx[G].attempt(step(p, generalize, unsafeSpecialize)).flatMap {
+          case Left(e)        => step(handler(e), generalize, unsafeSpecialize)
+          case Right(Left(r)) => StateT.pure(Left(r))
+          case Right(Right((hd, tl))) =>
+            StateT.pure(Right(hd -> Pull.handleErrorWith(tl)(handler)))
+        }
     }
 
-  def raiseError[F[_], O, R](e: Throwable): Pull2[F, O, R] =
-    new PullImpl[F, O, R] {
+  def raiseError[F[_]](e: Throwable): Pull[F, Nothing, Nothing] =
+    new PullImpl[F, Nothing, Nothing] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, R]] =
-        G.raiseError(e)
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, Nothing, Nothing] =
+        Ctx.raiseError(e)
     }
+  def fail[F[_]](e: Throwable): Pull[F, Nothing, Nothing] = raiseError(e)
 
-  def scope[F[_], O](p: Pull2[F, O, Unit]): Pull2[F, O, Unit] =
+  def scope[F[_], O](p: Pull[F, O, Unit]): Pull[F, O, Unit] =
     new PullImpl[F, O, Unit] {
       def run[G[_]](
           generalize: F ~> G,
-          unsafeSpecialize: G ~> F,
-          ctx: Context[G]
-      )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O, Unit]] =
-        ctx.arc.attachResource(Arc.make[G]).allocated.flatMap { case (child, release) =>
-          val c = child.get
-          step(p, generalize, unsafeSpecialize, Context(c, c :: ctx.parents))
-            .flatMap[Unconsed[F, G, O, Unit]] {
-              case Unconsed(ctx, Left(r))         => release.as(Unconsed(ctx, Left(r)))
-              case Unconsed(ctx, Right((hd, tl))) =>
-                // move to the parent scope
-                val tl0 = (_: Context[G]) => release >> tl(ctx)
-                G.pure(Unconsed(ctx, Right(hd -> tl0)))
-            }
+          unsafeSpecialize: G ~> F
+      )(implicit G: Compiler.Target[G]): Unconsed[F, G, O, Unit] =
+        StateT.get[G, Context[G]].flatMap { before =>
+          StateT.liftF(before.arc.attachResource(Arc.make[G]).allocated).flatMap {
+            case (child, release) =>
+              val c = child.get
+              StateT.set[G, Context[G]](Context(c, before.arc :: before.parents)) >>
+                step(p, generalize, unsafeSpecialize).flatMap {
+                  case l @ Left(_) => StateT.setF(release.as(before)).as(l)
+                  case Right((hd, tl)) =>
+                    val finalizer: Pull[F, O, Unit] = new PullImpl[F, O, Unit] {
+                      def run[H[_]](generalizeInner: F ~> H, unsafeSpecializeInner: H ~> F)(implicit
+                          H: Compiler.Target[H]
+                      ): Unconsed[F, H, O, Unit] = {
+                        val p: Ctx[H, Unit] =
+                          if (H == G) {
+                            // if we're in the same evaluation, run finalizer and move the scope back
+                            StateT.setF(release.as(before).asInstanceOf[H[Context[H]]])
+                          } else {
+                            // just run the finalizer, the caller is responsible for scope lifetimes
+                            // this part usually just throws a scope lookup exception
+                            StateT.liftF(generalizeInner(unsafeSpecialize(release)))
+                          }
+
+                        p.as(Left(()))
+                      }
+                    }
+                    StateT.pure(Right(hd -> (tl >> finalizer)))
+                }
+          }
         }
     }
 
-  implicit def monadForPull[F[_], O]: Monad[Pull2[F, O, *]] = ???
+  def uncons[F[_], O, A](
+      p: Pull[F, O, A]
+  ): Pull[F, Nothing, Either[A, (Chunk[O], Pull[F, O, A])]] =
+    new PullImpl[F, Nothing, Either[A, (Chunk[O], Pull[F, O, A])]] {
+      def run[G[_]](
+          generalize: F ~> G,
+          unsafeSpecialize: G ~> F
+      )(implicit
+          G: Compiler.Target[G]
+      ): Unconsed[F, G, Nothing, Either[A, (Chunk[O], Pull[F, O, A])]] =
+        step(p, generalize, unsafeSpecialize).map(_.asLeft)
+    }
 
-  def flatMapOutput[F[_], F2[x] >: F[x], O, O2](
-      p: Pull2[F, O, Unit],
-      f: O => Pull2[F, O2, Unit]
-  ): Pull2[F, O2, Unit] = new PullImpl[F, O2, Unit] {
-    def run[G[_]](
-        generalize: F ~> G,
-        unsafeSpecialize: G ~> F,
-        root: Context[G]
-    )(implicit G: Compiler.Target[G]): G[Unconsed[F, G, O2, Unit]] = {
-      def go(uc: Unconsed[F, G, O, Unit]) =
-        uc.cont match {
-          case Left(()) => G.pure(Unconsed(uc.context, Left(())))
-          case Right((hd, tl)) =>
-            step(hd.traverse_(f), generalize, unsafeSpecialize, root).flatMap(go)
-            ???
+  def flatMapOutput[F[_], O, O2](
+      p: Pull[F, O, Unit],
+      f: O => Pull[F, O2, Unit]
+  ): Pull[F, O2, Unit] =
+    uncons(p).flatMap {
+      case Left(())        => Pull.done
+      case Right((hd, tl)) => hd.traverse_(f) >> Pull.flatMapOutput(tl, f)
+    }
+
+  def acquire[F[_], A](
+      resource: F[A],
+      release: (A, ExitCase) => F[Unit]
+  ): Pull[F, Nothing, A] =
+    new PullImpl[F, Nothing, A] {
+      def run[G[_]](generalize: F ~> G, unsafeSpecialize: G ~> F)(implicit
+          G: Compiler.Target[G]
+      ): Unconsed[F, G, Nothing, A] =
+        StateT.get[G, Context[G]].flatMapF { ctx =>
+          val r =
+            Resource.makeCase(generalize(resource))((a, ec) => G.unit >> generalize(release(a, ec)))
+          ctx.arc
+            .attachResource(r)
+            .allocated
+            .map { case (x, _) => x.get.asLeft }
         }
+    }
 
-      step(p, generalize, unsafeSpecialize, root).flatMap {
-        case Unconsed(ctx, Left(())) => G.pure(Unconsed(ctx, Left(())))
-        case Unconsed(ctx, Right((hd, tl))) =>
-          val tl0 = tl.andThen(_.map(Pull2.flatMapOutput[F, F2, O, O2](_, f)))
-          hd.traverse_(f)
-          ???
+  def acquireCancelable[F[_], A](
+      resource: Poll[F] => F[A],
+      release: (A, ExitCase) => F[Unit]
+  )(implicit F: MonadCancel[F, ?]): Pull[F, Nothing, A] =
+    acquire(F.uncancelable(resource), release)
+
+  def translate[F[_], H[_], O](
+      p: Pull[F, O, Unit],
+      fk: F ~> H
+  ): Pull[H, O, Unit] =
+    new PullImpl[H, O, Unit] {
+      def run[G[_]](generalize: H ~> G, unsafeSpecialize: G ~> H)(implicit
+          G: Compiler.Target[G]
+      ): Unconsed[H, G, O, Unit] = {
+        val hf = new FunctionK[H, F] {
+          def apply[A](fa: H[A]): F[A] =
+            throw new ClassCastException(
+              "This causes a ClassCastException in the current implementation"
+            )
+        }
+        val fg = fk.andThen(generalize)
+        val gf = unsafeSpecialize.andThen(hf)
+        step(p, fg, gf).map {
+          case Left(a)         => Left(a)
+          case Right((hd, tl)) => Right((hd, Pull.translate(tl, fk)))
+        }
       }
     }
-  }
+
+  def interruptWhen[F[_], O, A](
+      p: Pull[F, O, A],
+      haltOnSignal: F[Either[Throwable, Unit]]
+  ): Pull[F, O, Option[A]] =
+    new PullImpl[F, O, Option[A]] {
+      def run[G[_]](generalize: F ~> G, unsafeSpecialize: G ~> F)(implicit
+          G: Compiler.Target[G]
+      ): Unconsed[F, G, O, Option[A]] =
+        G.concurrent match {
+          case None => step(p.map(_.some), generalize, unsafeSpecialize)
+          case Some(c) =>
+            StateT
+              .get[G, Context[G]]
+              .flatMapF { ctx =>
+                c.race(
+                  generalize(haltOnSignal).rethrow,
+                  step(p, generalize, unsafeSpecialize).run(ctx)
+                )
+              }
+              .flatMap {
+                case Left(())               => StateT.pure(Left(None))
+                case Right((ctx2, Left(a))) => StateT.set(ctx2).as(Left(Some(a)))
+                case Right((ctx2, Right((hd, tl)))) =>
+                  StateT.set(ctx2).as(Right(hd -> Pull.interruptWhen(tl, haltOnSignal)))
+              }
+        }
+    }
+
+  private[fs2] def mapOutput[F[_], O, P](s: Stream[F, O], f: O => P): Pull[F, P, Unit] =
+    scope(mapOutputNoScope(s, f))
+
+  /** Like `mapOutput` but does not insert an interruption scope. */
+  private[fs2] def mapOutputNoScope[F[_], O, P](
+      s: Stream[F, O],
+      f: O => P
+  ): Pull[F, P, Unit] =
+    s.pull.echo.unconsFlatMap(hd => Pull.output(hd.map(f)))
+
+  private[fs2] val outUnit: Pull[Pure, Unit, Unit] = output(Chunk.unit)
+
+  def leaseable[F[_]](implicit F: MonadCancel[F, ?]): Pull[F, Nothing, List[Leasable[F]]] =
+    new PullImpl[F, Nothing, List[Leasable[F]]] {
+      def run[G[_]](generalize: F ~> G, unsafeSpecialize: G ~> F)(implicit
+          G: Compiler.Target[G]
+      ): Unconsed[F, G, Nothing, List[Leasable[F]]] =
+        StateT.get[G, Context[G]].map { ctx =>
+          val l = ctx.arc :: ctx.parents
+          Left(l.map(_.mapK(unsafeSpecialize)))
+        }
+    }
+
+  def leaseAll[F[_]](implicit F: MonadCancel[F, ?]): Pull[F, Nothing, Resource[F, Unit]] =
+    leaseable.map(_.traverse_(_.lease))
 }
+// }

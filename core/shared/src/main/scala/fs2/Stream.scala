@@ -1036,7 +1036,7 @@ final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull[F,
     */
   def evalMap[F2[x] >: F[x], O2](f: O => F2[O2]): Stream[F2, O2] = {
     def evalOut(o: O) = Pull.eval(f(o)).flatMap(Pull.output1)
-    underlying.flatMapOutput(evalOut).streamNoScope
+    underlying.flatMapOutput[F2, O2](evalOut).streamNoScope
   }
 
   /** Like `evalMap`, but operates on chunks for performance. This means this operator
@@ -1605,7 +1605,7 @@ final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull[F,
     * }}}
     */
   def handleErrorWith[F2[x] >: F[x], O2 >: O](h: Throwable => Stream[F2, O2]): Stream[F2, O2] =
-    Pull.scope(underlying).handleErrorWith(e => h(e).underlying).streamNoScope
+    underlying.handleErrorWith(e => h(e).underlying).stream
 
   /** Emits the first element of this stream (if non-empty) and then halts.
     *
@@ -1728,7 +1728,9 @@ final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull[F,
   def interruptAfter[F2[x] >: F[x]: Temporal](
       duration: FiniteDuration
   ): Stream[F2, O] =
-    interruptWhen[F2](Temporal[F2].sleep(duration).attempt)
+    Stream
+      .bracket(Temporal[F2].sleep(duration).start)(_.cancel)
+      .flatMap(timer => interruptWhen[F2](timer.joinWithUnit.attempt))
 
   /** Ties this stream to the given `haltWhenTrue` stream.
     * The resulting stream performs all the effects and emits all the outputs
@@ -1790,12 +1792,12 @@ final class Stream[+F[_], +O] private[fs2] (private[fs2] val underlying: Pull[F,
   def interruptWhen[F2[x] >: F[x]](
       haltOnSignal: F2[Either[Throwable, Unit]]
   ): Stream[F2, O] =
-    (Pull.interruptWhen(haltOnSignal) >> this.pull.echo).stream.interruptScope
+    Pull.interruptWhen(this.pull.echo, haltOnSignal).void.stream.interruptScope
 
   /** Creates a scope that may be interrupted by calling scope#interrupt.
     */
   def interruptScope: Stream[F, O] =
-    Pull.interruptScope(underlying).streamNoScope
+    Pull.scope(underlying).streamNoScope
 
   /** Emits the specified separator between every pair of elements in the source stream.
     *
@@ -4522,11 +4524,11 @@ object Stream extends StreamLowPriority {
                 cancelResult.fold(t => stop(Some(t)), _ => F.unit)
             }
 
-          def runInner(inner: Stream[F, O], outerScope: Scope[F]): F[Unit] =
+          def runInner(inner: Stream[F, O], outerScope: Resource[F, Unit]): F[Unit] =
             F.uncancelable { _ =>
-              outerScope.lease
+              outerScope.allocated
                 .flatTap(_ => available.acquire >> incrementRunning)
-                .flatMap { lease =>
+                .flatMap { case (_, release) =>
                   F.start {
                     inner.chunks
                       .foreach(s => output.send(s).void)
@@ -4534,7 +4536,7 @@ object Stream extends StreamLowPriority {
                       .compile
                       .drain
                       .guaranteeCase { oc =>
-                        lease.cancel.rethrow
+                        release
                           .guaranteeCase {
                             case Outcome.Succeeded(fu) =>
                               onOutcome(oc <* Outcome.succeeded(fu), Either.unit)
@@ -4557,7 +4559,7 @@ object Stream extends StreamLowPriority {
               outer
                 .flatMap(inner =>
                   Pull
-                    .getScope[F]
+                    .leaseAll[F]
                     .flatMap(outerScope => Pull.eval(runInner(inner, outerScope)))
                     .streamNoScope
                 )
@@ -4965,9 +4967,10 @@ object Stream extends StreamLowPriority {
       * If you are not pulling from multiple streams, consider using `uncons`.
       */
     def stepLeg: Pull[F, Nothing, Option[StepLeg[F, O]]] =
-      Pull.getScope[F].flatMap { scope =>
-        new StepLeg[F, O](Chunk.empty, scope.id, self.underlying).stepLeg
-      }
+      uncons.map(_.map { case (hd, tl) => new StepLeg(hd, tl.underlying) })
+    // Pull.getScope[F].flatMap { scope =>
+    //   new StepLeg[F, O](Chunk.empty, scope.id, self.underlying).stepLeg
+    // }
 
     /** Emits the first `n` elements of the input. */
     def take(n: Long): Pull[F, O, Option[Stream[F, O]]] =
@@ -5428,7 +5431,7 @@ object Stream extends StreamLowPriority {
     */
   final class StepLeg[+F[_], +O](
       val head: Chunk[O],
-      private[fs2] val scopeId: Unique.Token,
+      // private[fs2] val scopeId: Unique.Token,
       private[fs2] val next: Pull[F, O, Unit]
   ) { self =>
 
@@ -5438,22 +5441,16 @@ object Stream extends StreamLowPriority {
       *
       * Note that resulting stream won't contain the `head` of this leg.
       */
-    def stream: Stream[F, O] = {
-      def go(leg: StepLeg[F, O]): Pull[F, O, Unit] =
-        Pull.output(leg.head) >> Pull.stepLeg(leg).flatMap {
-          case None       => Pull.done
-          case Some(nleg) => go(nleg)
-        }
-      go(self.setHead(Chunk.empty)).stream
-    }
+    def stream: Stream[F, O] =
+      (Pull.output(head) >> next).stream
 
     /** Replaces head of this leg. Useful when the head was not fully consumed. */
     def setHead[O2 >: O](nextHead: Chunk[O2]): StepLeg[F, O2] =
-      new StepLeg[F, O2](nextHead, scopeId, next)
+      new StepLeg[F, O2](nextHead, next)
 
     /** Provides an `uncons`-like operation on this leg of the stream, dropping current `head` */
     def stepLeg: Pull[F, Nothing, Option[StepLeg[F, O]]] =
-      Pull.stepLeg(self)
+      next.uncons.map(_.map { case (hd, tl) => new StepLeg[F, O](hd, tl) })
   }
 
   /**  Implementation for parZip. `AnyVal` classes do not allow inner

@@ -1,29 +1,25 @@
 {
+  description = "Shell for dev";
+
   inputs = {
-    typelevel-nix.url = "github:typelevel/typelevel-nix";
-    nixpkgs.follows = "typelevel-nix/nixpkgs";
-    flake-utils.follows = "typelevel-nix/flake-utils";
+    nixpkgs.url = "nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils, typelevel-nix }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs {
-          inherit system;
-          overlays = [ typelevel-nix.overlay ];
-        };
-      in
-      {
-        devShell = pkgs.devshell.mkShell {
-          imports = [ typelevel-nix.typelevelShell ];
-          name = "fs2-shell";
-          typelevelShell = {
-            jdk.package = pkgs.jdk17;
-            nodejs.enable = true;
-            native.enable = true;
-            native.libraries = [ pkgs.zlib pkgs.s2n-tls pkgs.openssl ];
-          };
-        };
-      }
-    );
+  outputs = { flake-utils, self, nixpkgs, ... }: 
+  let
+    system = flake-utils.lib.system.x86_64-linux;
+    pkgs = nixpkgs.legacyPackages.${system};
+  in
+  {
+    devShells.${system}.default = pkgs.mkShell {
+      name = "catcheffect-dev";
+      nativeBuildInputs = [ 
+        pkgs.jdk11
+        pkgs.scalafmt
+        pkgs.zsh
+        pkgs.sbt
+      ];
+    };
+  };
 }

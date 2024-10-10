@@ -73,9 +73,7 @@ private[fs2] trait CompilerLowPriority2 {
           stream: Pull[F, O, Unit],
           init: B
       )(foldChunk: (B, Chunk[O]) => B): Resource[F, B] =
-        Resource
-          .makeCase(Scope.newRoot[F])((scope, ec) => scope.close(ec).rethrow)
-          .evalMap(scope => Pull.compile(stream, scope, true, init)(foldChunk))
+        Arc.make[F].evalMap(Pull.compile(stream, _, true, init)(foldChunk)).map { case (b, _) => b }
     }
 }
 
@@ -147,15 +145,16 @@ object Compiler extends CompilerLowPriority {
     private[fs2] def unique: F[Unique.Token]
     private[fs2] def ref[A](a: A): F[Ref[F, A]]
     private[fs2] def interruptContext(root: Unique.Token): Option[F[InterruptContext[F]]]
+    def concurrent: Option[Concurrent[F]]
 
     private[fs2] def compile[O, Out](
         p: Pull[F, O, Unit],
         init: Out,
         foldChunk: (Out, Chunk[O]) => Out
-    ): F[Out] =
-      Resource
-        .makeCase(Scope.newRoot[F](this))((scope, ec) => scope.close(ec).rethrow)
-        .use(scope => Pull.compile[F, O, Out](p, scope, false, init)(foldChunk))
+    ): F[Out] = {
+      implicit val T: Target[F] = this
+      Arc.make[F].use(Pull.compile(p, _, true, init)(foldChunk)).map { case (b, _) => b }
+    }
 
     def pure[A](a: A): F[A] = F.pure(a)
     def handleErrorWith[A](fa: F[A])(f: Throwable => F[A]): F[A] = F.handleErrorWith(fa)(f)
@@ -176,6 +175,7 @@ object Compiler extends CompilerLowPriority {
       private[fs2] def unique: F[Unique.Token] = Sync[F].unique
       private[fs2] def ref[A](a: A): F[Ref[F, A]] = Ref[F].of(a)
       private[fs2] def interruptContext(root: Unique.Token): Option[F[InterruptContext[F]]] = None
+      def concurrent = None
     }
 
     implicit def forSync[F[_]](implicit F: Sync[F]): Target[F] = F match {
@@ -196,6 +196,7 @@ object Compiler extends CompilerLowPriority {
       private[fs2] def interruptContext(root: Unique.Token): Option[F[InterruptContext[F]]] = Some(
         InterruptContext(root, F.unit)
       )
+      def concurrent = Some(F0)
     }
 
     implicit def forConcurrent[F[_]: Concurrent]: Target[F] =
